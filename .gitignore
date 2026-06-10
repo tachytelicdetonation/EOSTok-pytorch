@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+runs/
+*.ckpt
+*.pt
+*.npz
+.DS_Store
+*.egg-info/

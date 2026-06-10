@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: >-
+  This repository is an unofficial reimplementation. If you use it, please
+  cite both this repository and the original paper (see `references`).
+title: "EOSTok-pytorch: Unofficial PyTorch implementation of EOSTok"
+authors:
+  - family-names: Deshmukh
+    given-names: Tanmay
+type: software
+license: MIT
+repository-code: "https://github.com/tachytelicdetonation/EOSTok-pytorch"
+references:
+  - type: article
+    title: >-
+      End-to-End Autoregressive Image Generation with 1D Semantic Tokenizer
+    authors:
+      - family-names: Chu
+        given-names: Wenda
+      - family-names: Zhang
+        given-names: Bingliang
+      - family-names: Han
+        given-names: Jiaqi
+      - family-names: Li
+        given-names: Yizhuo
+      - family-names: Yang
+        given-names: Linjie
+      - family-names: Yue
+        given-names: Yisong
+      - family-names: Guo
+        given-names: Qiushan
+    year: 2026
+    url: "https://arxiv.org/abs/2605.00503"
+    notes: "arXiv:2605.00503"

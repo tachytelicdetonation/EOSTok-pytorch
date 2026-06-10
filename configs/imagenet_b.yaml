@@ -1,0 +1,68 @@
+# EOSTok-B on ImageNet-1K 256x256 -- Table 9. Paper: rFID 0.73, gFID 2.38
+# w/o guidance, 1.98 w/ guidance (164M AR + 165M tokenizer).
+
+run_name: eostok-imagenet-b
+seed: 42
+device: auto
+amp: auto
+
+data:
+  dataset: imagefolder
+  root: ./data/imagenet
+  image_size: 256
+  channels: 3
+  num_classes: 1000
+  batch_size: 256
+  num_workers: 16
+
+tokenizer:
+  patch_size: 16
+  hidden_dim: 768
+  enc_layers: 12
+  dec_layers: 12
+  num_heads: 12
+  num_latent_tokens: 256
+  latent_dim: 64
+
+quantizer:
+  codebook_size: 4096
+  temperature: 1.0
+  commit_weight: 1.0e-3
+  entropy_weight: 0.01
+
+ar:
+  layers: 12
+  hidden_dim: 1024
+  num_heads: 16
+  class_dropout: 0.1
+
+vfm:
+  enabled: true
+  model: dinov2_vitl14
+  decoder_align_layer: 6
+  weight: 1.0
+
+loss:
+  recon_l2: 1.0
+  recon_lpips: 1.0
+  gan: 0.1
+  lecam: 0.05
+  apr_l2: 1.0
+  apr_lpips: 1.0
+  ntp: 0.1
+  disc_start: 0
+
+train:
+  epochs: 400
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  beta1: 0.9
+  beta2_tokenizer: 0.999
+  beta2_ar: 0.95
+  ema_decay: 0.9999
+  nested_dropout: 0.5
+  grad_clip: 1.0
+  log_every: 100
+  sample_every: 5000
+  ckpt_every: 5000
+  out_dir: runs/imagenet_b
