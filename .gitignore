@@ -8,3 +8,6 @@ runs/
 *.npz
 .DS_Store
 *.egg-info/
+
+# Local skill / tooling output
+graphify-out/

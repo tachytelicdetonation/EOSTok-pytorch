@@ -4,8 +4,10 @@ Run:  python tests/test_smoke.py
 """
 
 import torch
+import torch.nn.functional as F
 
 from eostok.config import Config
+from eostok.criterion import Adversary, EOSTokCriterion
 from eostok.models import EOSTok
 
 
@@ -35,12 +37,13 @@ def test_forward_shapes_and_grads():
     y = torch.randint(0, 10, (4,))
 
     out = model(x, y, keep_tokens=5)
-    assert out["x_recon"].shape == (4, 1, 32, 32)
-    assert out["x_apr"].shape == (4, 1, 32, 32)
-    assert out["indices"].shape == (4, 8)
+    assert out.pixels.recon.shape == (4, 1, 32, 32)
+    assert out.pixels.apr.shape == (4, 1, 32, 32)
+    assert out.metrics.indices.shape == (4, 8)
 
-    loss = (out["x_recon"].pow(2).mean() + out["x_apr"].pow(2).mean()
-            + out["ntp_loss"] + out["commit_loss"] + 0.01 * out["entropy_loss"])
+    loss = (out.pixels.recon.pow(2).mean() + out.pixels.apr.pow(2).mean()
+            + out.reg_losses.ntp + out.reg_losses.commit
+            + 0.01 * out.reg_losses.entropy)
     loss.backward()
 
     # End-to-end gradient flow: pixel/NTP losses must reach encoder, codebook, AR.
@@ -62,6 +65,51 @@ def test_generation():
     print("generation (incl. CFG) OK")
 
 
+def test_criterion_assembly_and_gate():
+    """The criterion is the test surface for Eq. 8: assert the weighting and the
+    disc_start gate without running the training loop."""
+    cfg = tiny_config()
+    cfg.loss.lpips_enabled = False  # no VGG download in a smoke test
+    cfg.loss.gan = 0.1
+    cfg.loss.disc_start = 5
+    cfg.vfm.enabled = False
+
+    model = EOSTok(cfg)
+    adversary = Adversary(cfg)
+    criterion = EOSTokCriterion(cfg, adversary)
+
+    x = torch.randn(4, 1, 32, 32)
+    y = torch.randint(0, 10, (4,))
+    out = model(x, y, keep_tokens=5)
+
+    # Gate closed before disc_start -> the GAN term is exactly zero.
+    assert not adversary.active(0)
+    loss0, m0 = criterion(out, x, 0)
+    assert m0["g"].item() == 0.0
+
+    # Hand-assemble Eq. 8 (LPIPS off, VFM off) and compare term-for-term.
+    w, qw = cfg.loss, cfg.quantizer
+    expected = (
+        w.recon_l2 * F.mse_loss(out.pixels.recon, x)
+        + w.apr_l2 * F.mse_loss(out.pixels.apr, x)
+        + qw.commit_weight * out.reg_losses.commit
+        + qw.entropy_weight * out.reg_losses.entropy
+        + w.ntp * out.reg_losses.ntp
+    )
+    assert torch.allclose(loss0, expected, atol=1e-6)
+
+    # Gate open at disc_start -> the GAN term switches on.
+    assert adversary.active(5)
+    _, m1 = criterion(out, x, 5)
+    assert m1["g"].item() != 0.0
+
+    # The borrowed discriminator is NOT a param of the criterion (it belongs to
+    # the adversary's optimizer).
+    crit_params = {id(p) for p in criterion.parameters()}
+    assert not any(id(p) in crit_params for p in adversary.parameters())
+    print("criterion assembly + disc_start gate OK")
+
+
 def test_reconstruct():
     cfg = tiny_config()
     model = EOSTok(cfg).eval()
@@ -73,6 +121,7 @@ def test_reconstruct():
 
 if __name__ == "__main__":
     test_forward_shapes_and_grads()
+    test_criterion_assembly_and_gate()
     test_generation()
     test_reconstruct()
     print("all smoke tests passed")

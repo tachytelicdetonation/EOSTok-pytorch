@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
+from typing import get_type_hints
 
 import yaml
 
@@ -101,18 +102,21 @@ class Config:
 
 
 def _build(cls, d: dict):
+    # The field's declared type is the only source of truth for nesting: any
+    # field annotated as a dataclass (DataConfig, TrainConfig, ...) recurses.
+    # `get_type_hints` resolves the string annotations that `from __future__
+    # import annotations` leaves on the fields.
+    hints = get_type_hints(cls)
+    valid = {f.name for f in fields(cls)}
     kwargs = {}
-    valid = {f.name: f for f in fields(cls)}
     for key, val in d.items():
         if key not in valid:
             raise KeyError(f"Unknown config key '{key}' for {cls.__name__}")
-        ftype = valid[key].type
-        sub = {
-            "data": DataConfig, "tokenizer": TokenizerConfig,
-            "quantizer": QuantizerConfig, "ar": ARConfig,
-            "vfm": VFMConfig, "loss": LossConfig, "train": TrainConfig,
-        }.get(key)
-        kwargs[key] = _build(sub, val) if sub and isinstance(val, dict) else val
+        ftype = hints[key]
+        if is_dataclass(ftype) and isinstance(val, dict):
+            kwargs[key] = _build(ftype, val)
+        else:
+            kwargs[key] = val
     return cls(**kwargs)
 
 

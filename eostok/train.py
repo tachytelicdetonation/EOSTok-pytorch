@@ -18,17 +18,13 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from .config import Config, load_config
+from .criterion import Adversary, EOSTokCriterion
 from .data import build_loader
 from .ema import EMA
-from .losses import PerceptualLoss
 from .models import EOSTok
-from .models.discriminator import (
-    LeCamRegularizer, PatchDiscriminator, hinge_d_loss, hinge_g_loss,
-)
 
 
 def pick_device(name: str) -> torch.device:
@@ -85,52 +81,53 @@ def main():
     total_steps = args.max_steps or cfg.train.epochs * steps_per_epoch
 
     model = EOSTok(cfg).to(device)
-    disc = PatchDiscriminator(cfg.data.channels).to(device)
-    lecam = LeCamRegularizer().to(device)
-    perceptual = PerceptualLoss().to(device) if cfg.loss.lpips_enabled else None
-
-    vfm = None
-    if cfg.vfm.enabled:
-        from .models.vfm import VFMAligner
-        vfm = VFMAligner(
-            cfg.vfm.model, cfg.tokenizer.hidden_dim, cfg.tokenizer.hidden_dim,
-            model.encoder.grid,
-        ).to(device)
+    # The objective, as two sibling modules (opposed optimizers).
+    adversary = Adversary(cfg).to(device)
+    criterion = EOSTokCriterion(cfg, adversary).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[eostok] model params: {n_params / 1e6:.1f}M "
           f"(tokenizer {sum(p.numel() for m in (model.encoder, model.decoder, model.quantizer) for p in m.parameters()) / 1e6:.1f}M, "
           f"AR {sum(p.numel() for p in model.ar.parameters()) / 1e6:.1f}M)")
 
-    # Adam with different beta2 for tokenizer vs AR (Table 9).
+    # Adam with different beta2 for tokenizer vs AR (Table 9). The criterion's
+    # trainable params (VFM projectors; PerceptualLoss is frozen) train with the
+    # tokenizer, so they ride in the tokenizer group.
     tok_params = (list(model.encoder.parameters())
                   + list(model.decoder.parameters())
-                  + list(model.quantizer.parameters()))
+                  + list(model.quantizer.parameters())
+                  + [p for p in criterion.parameters() if p.requires_grad])
     ar_params = list(model.ar.parameters())
-    if vfm is not None:
-        tok_params += [p for p in vfm.parameters() if p.requires_grad]
     tc = cfg.train
     opt_g = torch.optim.Adam([
         {"params": tok_params, "betas": (tc.beta1, tc.beta2_tokenizer)},
         {"params": ar_params, "betas": (tc.beta1, tc.beta2_ar)},
     ], lr=tc.lr)
-    opt_d = torch.optim.Adam(disc.parameters(), lr=tc.disc_lr,
+    # The discriminator is the only thing the adversary owns params for.
+    opt_d = torch.optim.Adam(adversary.parameters(), lr=tc.disc_lr,
                              betas=(tc.beta1, tc.beta2_tokenizer))
 
     ema = EMA(model, tc.ema_decay)
+
+    def checkpoint() -> dict:
+        return {
+            "model": model.state_dict(), "adversary": adversary.state_dict(),
+            "criterion": criterion.state_dict(), "ema": ema.state_dict(),
+            "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(), "step": step,
+        }
 
     step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model"])
-        disc.load_state_dict(ckpt["disc"])
+        adversary.load_state_dict(ckpt["adversary"])
+        criterion.load_state_dict(ckpt["criterion"])
         ema.load_state_dict(ckpt["ema"])
         opt_g.load_state_dict(ckpt["opt_g"])
         opt_d.load_state_dict(ckpt["opt_d"])
         step = ckpt["step"]
         print(f"[eostok] resumed from {args.resume} at step {step}")
 
-    lw = cfg.loss
     L = cfg.tokenizer.num_latent_tokens
     fixed_labels = torch.arange(cfg.data.num_classes, device=device).repeat(8)[:64]
 
@@ -158,34 +155,7 @@ def main():
                    if dtype else torch.autocast(device.type, enabled=False))
             with ctx:
                 out = model(x, y_in, keep_tokens=k)
-                x_recon, x_apr = out["x_recon"], out["x_apr"]
-
-                rec_l2 = F.mse_loss(x_recon, x)
-                apr_l2 = F.mse_loss(x_apr, x)
-                rec_lp = perceptual(x_recon, x) if perceptual else x.new_zeros(())
-                apr_lp = perceptual(x_apr, x) if perceptual else x.new_zeros(())
-
-                g_loss = x.new_zeros(())
-                if lw.gan > 0 and step >= lw.disc_start:
-                    g_loss = hinge_g_loss(disc(x_recon))
-
-                sem_loss = x.new_zeros(())
-                if vfm is not None:
-                    yv = vfm.features(x)
-                    sem_loss = vfm.implicit_loss(out["h_enc"], yv)
-                    if out["h_dec"] is not None:
-                        sem_loss = sem_loss + vfm.decoder_loss(
-                            out["h_dec"], yv.repeat(2, 1, 1))
-
-                loss = (
-                    lw.recon_l2 * rec_l2 + lw.recon_lpips * rec_lp
-                    + lw.gan * g_loss
-                    + cfg.quantizer.commit_weight * out["commit_loss"]
-                    + cfg.quantizer.entropy_weight * out["entropy_loss"]
-                    + lw.ntp * out["ntp_loss"]
-                    + lw.apr_l2 * apr_l2 + lw.apr_lpips * apr_lp
-                    + cfg.vfm.weight * sem_loss
-                )
+                loss, m = criterion(out, x, step)
 
             opt_g.zero_grad(set_to_none=True)
             loss.backward()
@@ -196,13 +166,11 @@ def main():
             opt_g.step()
             ema.update(model)
 
-            # --- Discriminator step
+            # --- Discriminator step (opposed objective; gate owned by the adversary)
             d_loss = x.new_zeros(())
-            if lw.gan > 0 and step >= lw.disc_start:
+            if adversary.active(step):
                 with ctx:
-                    real = disc(x)
-                    fake = disc(x_recon.detach())
-                    d_loss = hinge_d_loss(real, fake) + lw.lecam * lecam(real, fake)
+                    d_loss = adversary.d_loss(x, out.pixels.recon, step)
                 opt_d.zero_grad(set_to_none=True)
                 d_loss.backward()
                 opt_d.step()
@@ -210,10 +178,10 @@ def main():
             if step % tc.log_every == 0:
                 ips = (step + 1) * cfg.data.batch_size / (time.time() - t0)
                 print(
-                    f"step {step}/{total_steps} | loss {loss.item():.4f} | "
-                    f"rec_l2 {rec_l2.item():.4f} lpips {rec_lp.item():.4f} | "
-                    f"ntp {out['ntp_loss'].item():.4f} ar_acc {out['ar_acc'].item():.3f} | "
-                    f"apr {apr_l2.item():.4f} | d {d_loss.item():.4f} | "
+                    f"step {step}/{total_steps} | loss {m['loss'].item():.4f} | "
+                    f"rec_l2 {m['rec_l2'].item():.4f} lpips {m['rec_lp'].item():.4f} | "
+                    f"ntp {m['ntp'].item():.4f} ar_acc {m['ar_acc'].item():.3f} | "
+                    f"apr {m['apr_l2'].item():.4f} | d {d_loss.item():.4f} | "
                     f"k {k} lr {lr:.2e} | {ips:.0f} img/s"
                 )
 
@@ -230,19 +198,11 @@ def main():
                 model.train()
 
             if step > 0 and step % tc.ckpt_every == 0:
-                torch.save({
-                    "model": model.state_dict(), "disc": disc.state_dict(),
-                    "ema": ema.state_dict(), "opt_g": opt_g.state_dict(),
-                    "opt_d": opt_d.state_dict(), "step": step,
-                }, out_dir / "last.ckpt")
+                torch.save(checkpoint(), out_dir / "last.ckpt")
 
             step += 1
 
-    torch.save({
-        "model": model.state_dict(), "disc": disc.state_dict(),
-        "ema": ema.state_dict(), "opt_g": opt_g.state_dict(),
-        "opt_d": opt_d.state_dict(), "step": step,
-    }, out_dir / "last.ckpt")
+    torch.save(checkpoint(), out_dir / "last.ckpt")
     print(f"[eostok] done at step {step}; checkpoint -> {out_dir / 'last.ckpt'}")
 
 

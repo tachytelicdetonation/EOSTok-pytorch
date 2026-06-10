@@ -9,6 +9,8 @@ This module wires the full forward pass of Fig. 2:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +19,45 @@ from ..config import Config
 from .ar import ARModel
 from .quantizer import IBQQuantizer
 from .tokenizer import Decoder1D, Encoder1D
+
+
+@dataclass
+class Pixels:
+    """Decoded images, both in [-1, 1]."""
+    recon: torch.Tensor  # reconstruction pass: decode(z_q)
+    apr: torch.Tensor    # APR pass: decode of teacher-forced AR predictions
+
+
+@dataclass
+class Activations:
+    """Hidden states the VFM aligner reads; both None when alignment is off."""
+    h_enc: torch.Tensor          # encoder hidden patch embeddings (B, N, D)
+    h_dec: torch.Tensor | None   # decoder mask-token states at the align layer (2B, N, D)
+
+
+@dataclass
+class RegLosses:
+    """Losses the model computes internally (intrinsic to the quantizer / AR)."""
+    commit: torch.Tensor
+    entropy: torch.Tensor
+    ntp: torch.Tensor
+
+
+@dataclass
+class Metrics:
+    """Diagnostics — never part of the optimized objective."""
+    ar_acc: torch.Tensor
+    indices: torch.Tensor  # ground-truth code indices (B, L), for inspection/eval
+
+
+@dataclass
+class EOSTokOutput:
+    """One forward pass, grouped by role so the criterion and the logger each
+    read one group instead of categorising a flat dict by hand."""
+    pixels: Pixels
+    activations: Activations
+    reg_losses: RegLosses
+    metrics: Metrics
 
 
 class EOSTok(nn.Module):
@@ -40,7 +81,8 @@ class EOSTok(nn.Module):
             a.hidden_dim, a.layers, a.num_heads,
         )
 
-    def forward(self, x: torch.Tensor, labels: torch.Tensor, keep_tokens: int | None = None):
+    def forward(self, x: torch.Tensor, labels: torch.Tensor,
+                keep_tokens: int | None = None) -> EOSTokOutput:
         """Joint training forward. keep_tokens k (nested dropout) truncates the
         latent sequence fed to the decoder; NTP always uses the full sequence."""
         z, h_enc = self.encoder(x)
@@ -66,17 +108,16 @@ class EOSTok(nn.Module):
         dec_out, h_dec = self.decoder(dec_in)
         x_recon, x_apr = dec_out.chunk(2, dim=0)
 
-        return {
-            "x_recon": x_recon,
-            "x_apr": x_apr,
-            "h_enc": h_enc,
-            "h_dec": h_dec,  # (2B, N, D) at align layer, or None
-            "indices": indices,
-            "commit_loss": quant["commit_loss"],
-            "entropy_loss": quant["entropy_loss"],
-            "ntp_loss": ntp_loss,
-            "ar_acc": ar_acc,
-        }
+        return EOSTokOutput(
+            pixels=Pixels(recon=x_recon, apr=x_apr),
+            activations=Activations(h_enc=h_enc, h_dec=h_dec),
+            reg_losses=RegLosses(
+                commit=quant["commit_loss"],
+                entropy=quant["entropy_loss"],
+                ntp=ntp_loss,
+            ),
+            metrics=Metrics(ar_acc=ar_acc, indices=indices),
+        )
 
     @torch.no_grad()
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
