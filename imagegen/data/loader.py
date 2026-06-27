@@ -7,6 +7,7 @@ same prompt path.
 
 from __future__ import annotations
 
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 from torchvision import transforms
@@ -68,6 +69,30 @@ class HFImageCaptionDataset:
         return self.transform(image), caption
 
 
+class RandomImageCaptionDataset:
+    """Synthetic image+caption data for OFFLINE code-checks. No download, no real
+    content -- just exercises the full train loop end-to-end (shapes, optimizer,
+    EMA, sampling, checkpoint) so we can confirm the code runs before a GPU run.
+    Deterministic per index so reruns match. Caching is unsupported (use __tiny__
+    live text)."""
+
+    _CAPTIONS = ("a photo of a dog", "a small animal", "an outdoor scene", "a portrait")
+
+    def __init__(self, cfg: DataConfig, train: bool = True, length: int = 64):
+        self.cfg = cfg
+        self.length = length
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int):
+        g = torch.Generator().manual_seed(idx)
+        img = torch.rand(
+            self.cfg.channels, self.cfg.image_size, self.cfg.image_size, generator=g
+        )
+        return img * 2 - 1, self._CAPTIONS[idx % len(self._CAPTIONS)]
+
+
 def build_dataset(
     cfg: DataConfig,
     train: bool = True,
@@ -75,6 +100,8 @@ def build_dataset(
 ):
     if cfg.dataset == "hf_image_caption":
         return HFImageCaptionDataset(cfg, train, text_cache)
+    if cfg.dataset == "random":
+        return RandomImageCaptionDataset(cfg, train)
     raise ValueError(f"Unknown caption dataset: {cfg.dataset}")
 
 

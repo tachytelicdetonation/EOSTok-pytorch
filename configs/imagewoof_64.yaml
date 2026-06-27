@@ -77,6 +77,7 @@ train:
   beta2_ar: 0.95
   ema_decay: 0.999
   nested_dropout: 0.5
+  warmup_ratio: 0.03  # linear LR warmup over first 3% of steps, then cosine
   grad_clip: 1.0
   log_every: 50
   sample_every: 1000

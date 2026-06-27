@@ -25,6 +25,24 @@ from ..text import Condition, PreparedCondition, TextCondition, TextConditioner
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
+def _filter_logits(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
+    """Restrict (B, K) logits to the top-k codes and/or the nucleus (smallest set
+    whose cumulative prob >= top_p); filtered entries -> -inf. top_k<=0 and
+    top_p<=0 (or >=1) each disable their filter, so defaults reproduce plain
+    multinomial sampling. The top token is always kept."""
+    if top_k > 0:
+        kth = logits.topk(min(top_k, logits.shape[-1]), dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if 0.0 < top_p < 1.0:
+        ordered, order = torch.sort(logits, descending=True, dim=-1)
+        cum = ordered.softmax(dim=-1).cumsum(dim=-1)
+        drop = cum > top_p
+        drop[..., 1:] = drop[..., :-1].clone()  # shift: keep the crossing token
+        drop[..., 0] = False
+        logits = logits.masked_fill(drop.scatter(-1, order, drop), float("-inf"))
+    return logits
+
+
 class SwiGLU(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -154,6 +172,10 @@ class ARModel(nn.Module):
         self.blocks = nn.ModuleList([ARBlock(dim, num_heads) for _ in range(depth)])
         self.norm_f = nn.RMSNorm(dim)
         self.head = nn.Linear(dim, codebook_size, bias=False)
+        # Zero-init so step-0 logits are uniform: the NTP loss starts at log(K)
+        # and sends ~no gradient back through the soft-embed path into the
+        # encoder/codebook until the AR actually carries signal (LlamaGen).
+        nn.init.zeros_(self.head.weight)
 
     def prepare_condition(
         self,
@@ -262,12 +284,15 @@ class ARModel(nn.Module):
         condition: Condition,
         temperature: float = 1.0,
         cfg_scale: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.0,
     ) -> torch.Tensor:
         """Sample (B, L) code indices.
 
         CFG uses the same prefix-AR path with a null-token prefix as the
         unconditional branch: l_g = l_u + s * (l_c - l_u). Conditions are first
         normalized to PreparedCondition, then CFG duplicates that canonical batch.
+        top_k/top_p truncate the per-step categorical before sampling (0 = off).
         """
         device = self.pos_emb.device
         prepared = self.prepare_condition(condition, device)
@@ -292,7 +317,8 @@ class ARModel(nn.Module):
             if use_cfg:
                 lc, lu = logits.chunk(2)
                 logits = lu + cfg_scale * (lc - lu)
-            probs = (logits / max(temperature, 1e-6)).softmax(dim=-1)
+            logits = _filter_logits(logits / max(temperature, 1e-6), top_k, top_p)
+            probs = logits.softmax(dim=-1)
             next_token = torch.multinomial(probs, 1).squeeze(-1)
             tokens.append(next_token)
 

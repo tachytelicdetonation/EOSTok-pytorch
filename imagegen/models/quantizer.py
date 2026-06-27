@@ -28,31 +28,46 @@ class IBQQuantizer(nn.Module):
         self.codebook = nn.Parameter(torch.randn(codebook_size, latent_dim) * 0.02)
 
     def forward(self, z: torch.Tensor):
-        """z: (B, L, d). Returns dict with z_q, soft one-hot ind, indices, reg losses."""
-        z_n = F.normalize(z, dim=-1)
-        c_n = F.normalize(self.codebook, dim=-1)
+        """z: (B, L, d). Returns dict with z_q, soft one-hot ind, indices, reg
+        losses, and codebook-health diagnostics (perplexity, usage)."""
+        out_dtype = z.dtype
+        # Code assignment + entropy math stays fp32: under bf16 autocast the
+        # softmax/argmax over K codes and the entropy reductions (small
+        # differences of ~log K terms) lose precision, quietly weakening our
+        # only codebook-collapse mitigation. No-op off cuda (no autocast there).
+        with torch.autocast(z.device.type, enabled=False):
+            z_n = F.normalize(z.float(), dim=-1)
+            c_n = F.normalize(self.codebook.float(), dim=-1)
 
-        logits = torch.einsum("bld,kd->blk", z_n, c_n) / self.temperature
-        ind, p, indices = self.straight_through_onehot(logits)
-        z_q = torch.einsum("blk,kd->bld", ind, c_n)
+            logits = torch.einsum("bld,kd->blk", z_n, c_n) / self.temperature
+            ind, p, indices = self.straight_through_onehot(logits)
+            z_q = torch.einsum("blk,kd->bld", ind, c_n)
 
-        commit_loss = F.mse_loss(z_n, z_q.detach()) + 0.25 * F.mse_loss(z_n.detach(), z_q)
+            commit_loss = F.mse_loss(z_n, z_q.detach()) + 0.25 * F.mse_loss(z_n.detach(), z_q)
 
-        # Entropy regularization (MAGVIT-v2 style): confident per-token
-        # assignments, uniform usage across the batch.
-        eps = 1e-8
-        flat = p.reshape(-1, self.codebook_size)
-        per_sample_entropy = -(flat * (flat + eps).log()).sum(-1).mean()
-        avg_p = flat.mean(0)
-        codebook_entropy = -(avg_p * (avg_p + eps).log()).sum()
-        entropy_loss = per_sample_entropy - codebook_entropy
+            # Entropy regularization (MAGVIT-v2 style): confident per-token
+            # assignments, uniform usage across the batch.
+            eps = 1e-8
+            flat = p.reshape(-1, self.codebook_size)
+            per_sample_entropy = -(flat * (flat + eps).log()).sum(-1).mean()
+            avg_p = flat.mean(0)
+            codebook_entropy = -(avg_p * (avg_p + eps).log()).sum()
+            entropy_loss = per_sample_entropy - codebook_entropy
+
+            # Collapse alarm (no grad): effective #codes used (perplexity) and
+            # the fraction of the codebook touched this batch.
+            with torch.no_grad():
+                perplexity = codebook_entropy.exp()
+                usage = z.new_tensor(indices.unique().numel() / self.codebook_size)
 
         return {
-            "z_q": z_q,
-            "ind": ind,
+            "z_q": z_q.to(out_dtype),
+            "ind": ind.to(out_dtype),
             "indices": indices,
             "commit_loss": commit_loss,
             "entropy_loss": entropy_loss,
+            "perplexity": perplexity,
+            "usage": usage,
         }
 
     def straight_through_onehot(self, logits: torch.Tensor):

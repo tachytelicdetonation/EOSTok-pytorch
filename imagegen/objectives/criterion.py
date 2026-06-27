@@ -104,5 +104,7 @@ class ImageGenCriterion(nn.Module):
             "sem": sem.detach(),
             "ntp": reg.ntp.detach(),
             "ar_acc": out.metrics.ar_acc,
+            "cb_ppl": out.metrics.codebook_ppl,
+            "cb_use": out.metrics.codebook_usage,
         }
         return loss, metrics

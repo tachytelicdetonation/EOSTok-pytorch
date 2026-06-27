@@ -49,8 +49,12 @@ def amp_dtype(mode: str, device: torch.device):
     return torch.bfloat16 if device.type == "cuda" else None  # auto
 
 
-def cosine_lr(step: int, total: int, base: float, minimum: float) -> float:
-    t = min(step / max(total, 1), 1.0)
+def cosine_lr(
+    step: int, total: int, base: float, minimum: float, warmup: int = 0
+) -> float:
+    if warmup > 0 and step < warmup:
+        return base * (step + 1) / warmup  # linear warmup 0 -> base
+    t = min((step - warmup) / max(total - warmup, 1), 1.0)
     return minimum + 0.5 * (base - minimum) * (1 + math.cos(math.pi * t))
 
 
@@ -148,6 +152,9 @@ def main():
     random.seed(cfg.seed)
 
     device = pick_device(cfg.device)
+    if device.type == "cuda":  # free ~1.3-2x matmul throughput, no accuracy cost here
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     dtype = amp_dtype(cfg.amp, device)
     out_dir = Path(cfg.train.out_dir)
     (out_dir / "samples").mkdir(parents=True, exist_ok=True)
@@ -160,6 +167,7 @@ def main():
     loader = build_loader(cfg.data, train=True, text_cache=train_text_cache)
     steps_per_epoch = len(loader)
     total_steps = args.max_steps or cfg.train.epochs * steps_per_epoch
+    warmup_steps = int(cfg.train.warmup_ratio * total_steps)
 
     model = ImageGen(
         cfg,
@@ -251,7 +259,7 @@ def main():
                 torch.rand(batch_conditions, device=device) < cfg.ar.condition_dropout
             )
 
-            lr = cosine_lr(step, total_steps, tc.lr, tc.min_lr)
+            lr = cosine_lr(step, total_steps, tc.lr, tc.min_lr, warmup_steps)
             for group in opt_g.param_groups:
                 group["lr"] = lr
 
@@ -292,6 +300,7 @@ def main():
                     f"rec_l2 {m['rec_l2'].item():.4f} lpips {m['rec_lp'].item():.4f} | "
                     f"ntp {m['ntp'].item():.4f} ar_acc {m['ar_acc'].item():.3f} | "
                     f"apr {m['apr_l2'].item():.4f} | d {d_loss.item():.4f} | "
+                    f"cb_ppl {m['cb_ppl'].item():.1f} cb_use {m['cb_use'].item():.2f} | "
                     f"k {k} lr {lr:.2e} | {ips:.0f} img/s"
                 )
 

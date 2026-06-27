@@ -1,0 +1,55 @@
+# Offline RAM-safe code-check for MPS. Synthetic data + __tiny__ text backbone:
+# no Qwen download, no HF dataset, no OOM. Proves the train loop runs end-to-end
+# before a real GPU run. Run:
+#   python -m imagegen.cli.train --config configs/tiny.yaml --max-steps 8
+run_name: tiny
+seed: 42
+device: auto   # mps on Apple Silicon
+amp: off       # fp32 (MPS trains fp32 anyway)
+
+data:
+  dataset: random        # synthetic; see imagegen/data/loader.py
+  image_size: 32
+  channels: 3
+  batch_size: 4
+  num_workers: 0
+
+text:
+  model_name: __tiny__   # in-process stub backbone, no download
+  max_length: 16
+  freeze: true
+  cache_dataset: false   # live tiny backbone, no caption cache
+
+tokenizer:
+  patch_size: 8          # 32/8 -> 4x4 = 16 patch tokens
+  hidden_dim: 64
+  enc_layers: 2
+  dec_layers: 2
+  num_heads: 2
+  num_latent_tokens: 16  # L
+  latent_dim: 8          # d
+
+quantizer:
+  codebook_size: 256     # K
+  temperature: 1.0
+  commit_weight: 1.0e-3
+  entropy_weight: 0.01
+
+ar:
+  layers: 2
+  hidden_dim: 64
+  num_heads: 2
+  condition_dropout: 0.1
+
+train:
+  epochs: 1
+  lr: 1.0e-3
+  min_lr: 1.0e-5
+  warmup_ratio: 0.0      # moot over a handful of steps
+  grad_clip: 1.0
+  ema_decay: 0.99
+  nested_dropout: 0.5
+  log_every: 1
+  sample_every: 5        # exercise the EMA sample/generate path
+  ckpt_every: 1000
+  out_dir: runs/tiny

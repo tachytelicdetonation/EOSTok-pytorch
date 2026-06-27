@@ -49,6 +49,8 @@ class Metrics:
     """Diagnostics — never part of the optimized objective."""
     ar_acc: torch.Tensor
     indices: torch.Tensor  # ground-truth code indices (B, L), for inspection/eval
+    codebook_ppl: torch.Tensor   # effective #codes used (exp of batch-usage entropy)
+    codebook_usage: torch.Tensor  # fraction of the codebook touched this batch
 
 
 @dataclass
@@ -132,7 +134,12 @@ class ImageGen(nn.Module):
                 entropy=quant["entropy_loss"],
                 ntp=ntp_loss,
             ),
-            metrics=Metrics(ar_acc=ar_acc, indices=indices),
+            metrics=Metrics(
+                ar_acc=ar_acc,
+                indices=indices,
+                codebook_ppl=quant["perplexity"],
+                codebook_usage=quant["usage"],
+            ),
         )
 
     @torch.no_grad()
@@ -147,7 +154,9 @@ class ImageGen(nn.Module):
         condition: Condition,
         temperature: float = 1.0,
         cfg_scale: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.0,
     ) -> torch.Tensor:
-        indices = self.ar.generate(condition, temperature, cfg_scale)
+        indices = self.ar.generate(condition, temperature, cfg_scale, top_k, top_p)
         z_q = self.quantizer.codes_to_latents(indices)
         return self.decoder(z_q)[0]

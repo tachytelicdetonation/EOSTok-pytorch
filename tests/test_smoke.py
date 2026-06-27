@@ -56,11 +56,25 @@ def test_forward_shapes_and_grads():
     )
     loss.backward()
 
-    # End-to-end gradient flow: pixel/NTP losses must reach encoder, codebook, AR.
+    # End-to-end gradient flow: pixel/commit/entropy losses reach encoder+codebook
+    # via the tokenizer path (no head in between).
     assert model.encoder.patchify.weight.grad is not None
     assert model.encoder.patchify.weight.grad.abs().sum() > 0
     assert model.quantizer.codebook.grad is not None
     assert model.quantizer.codebook.grad.abs().sum() > 0
+    # The AR head learns from step 0...
+    assert model.ar.head.weight.grad is not None
+    assert model.ar.head.weight.grad.abs().sum() > 0
+    # ...but the zero-init head means NTP/APR send no gradient below it on the
+    # first step, so tok_emb (reached only through the head) is frozen one step
+    # (its grad is populated with zeros, not None).
+    assert model.ar.tok_emb.weight.grad is not None
+    assert model.ar.tok_emb.weight.grad.abs().sum() == 0
+    # Once the head is non-zero, gradient does reach tok_emb (wiring is intact).
+    torch.nn.init.normal_(model.ar.head.weight, std=0.02)
+    model.zero_grad(set_to_none=True)
+    out2 = model(x, captions, keep_tokens=5)
+    (out2.reg_losses.ntp + out2.pixels.apr.pow(2).mean()).backward()
     assert model.ar.tok_emb.weight.grad is not None
     assert model.ar.tok_emb.weight.grad.abs().sum() > 0
     print("forward/backward OK")
@@ -361,6 +375,23 @@ def test_trainable_text_encoder_must_be_saved():
     print("trainable text encoder checkpoint guard OK")
 
 
+def test_top_k_top_p_filter():
+    from imagegen.models.ar import _filter_logits
+
+    logits = torch.tensor([[3.0, 2.0, 1.0, -5.0]])
+    # off (defaults) leaves logits untouched
+    assert torch.equal(_filter_logits(logits.clone(), 0, 0.0), logits)
+    # top_k=1 keeps only the argmax, everything else -inf
+    out_k = _filter_logits(logits.clone(), 1, 0.0)
+    assert out_k[0, 0].item() == 3.0
+    assert torch.isinf(out_k[0, 1:]).all()
+    # nucleus keeps at least the top token and drops the far tail (-5.0)
+    out_p = _filter_logits(logits.clone(), 0, 0.9)
+    assert not torch.isinf(out_p[0, 0])
+    assert torch.isinf(out_p[0, 3])
+    print("top-k/top-p filter OK")
+
+
 if __name__ == "__main__":
     test_forward_shapes_and_grads()
     test_criterion_assembly_and_gate()
@@ -375,4 +406,5 @@ if __name__ == "__main__":
     test_caption_fingerprint_detects_reorder()
     test_load_ema_model_recon_skips_text_encoder()
     test_trainable_text_encoder_must_be_saved()
+    test_top_k_top_p_filter()
     print("all smoke tests passed")

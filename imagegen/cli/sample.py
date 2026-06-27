@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--cfg", type=float, default=1.0,
                     help="CFG scale s (1.0 = no guidance, as in headline results)")
+    ap.add_argument("--top-k", type=int, default=0, help="top-k code truncation (0 = off)")
+    ap.add_argument("--top-p", type=float, default=0.0, help="nucleus truncation (0 = off)")
     ap.add_argument("--prompt", action="append",
                     help="Caption prompt; repeat for multiple prompts")
     ap.add_argument("--prompts-file", default=None,
@@ -87,7 +89,9 @@ def main():
         while written < args.num:
             b = min(args.batch_size, args.num - written)
             batch_prompts = [prompts[i % len(prompts)] for i in range(written, written + b)]
-            imgs = model.generate(batch_prompts, args.temperature, args.cfg)
+            imgs = model.generate(
+                batch_prompts, args.temperature, args.cfg, args.top_k, args.top_p
+            )
             for i in range(b):
                 save_image((imgs[i] + 1) / 2, out_dir / f"{written + i:06d}.png")
             written += b
@@ -95,7 +99,9 @@ def main():
         print()
     else:
         grid_prompts = [prompts[i % len(prompts)] for i in range(args.num)]
-        imgs = model.generate(grid_prompts, args.temperature, args.cfg)
+        imgs = model.generate(
+            grid_prompts, args.temperature, args.cfg, args.top_k, args.top_p
+        )
         out = args.out or "samples.png"
         save_image((imgs + 1) / 2, out, nrow=int(args.num**0.5))
         print(f"[imagegen] wrote {out}")

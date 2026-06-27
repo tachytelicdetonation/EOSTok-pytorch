@@ -99,6 +99,7 @@ class TrainConfig:
     disc_lr: float = 1.0e-4
     ema_decay: float = 0.9999
     nested_dropout: float = 0.5  # probability of truncating decoder latents
+    warmup_ratio: float = 0.0  # fraction of total steps for linear LR warmup
     grad_clip: float = 1.0
     log_every: int = 50
     sample_every: int = 1000
