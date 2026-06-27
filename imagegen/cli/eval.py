@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import torch
 from torchvision.utils import save_image
 
 from ..config import load_config
@@ -25,16 +24,24 @@ from ..training.train_loop import pick_device
 from .sample import load_ema_model
 
 
-def dump_real(cfg, out: Path, num: int):
-    loader = build_loader(cfg.data, train=False)
-    out.mkdir(parents=True, exist_ok=True)
+def _dump(loader, make_batch, out_dir: Path, target: int, progress: bool = False) -> int:
+    """Save up to `target` images as {n:06d}.png, where `make_batch(item)` turns
+    one loader item into an image batch in [-1, 1]. The target guard runs BEFORE
+    make_batch, so no extra (expensive) model call is made once `target` is hit."""
+    out_dir.mkdir(parents=True, exist_ok=True)
     n = 0
-    for x, _ in loader:
-        for img in x:
-            if n >= num:
-                return n
-            save_image((img + 1) / 2, out / f"{n:06d}.png")
+    for item in loader:
+        if n >= target:
+            break
+        for img in make_batch(item):
+            if n >= target:
+                break
+            save_image((img + 1) / 2, out_dir / f"{n:06d}.png")
             n += 1
+        if progress:
+            print(f"\r  {n}/{target}", end="", flush=True)
+    if progress:
+        print()
     return n
 
 
@@ -82,40 +89,18 @@ def main():
     real_count = _count_pngs(real_dir)
     if real_count < target_num:
         print("[imagegen] dumping real images...")
-        real_count = dump_real(cfg, real_dir, target_num)
+        real_count = _dump(build_loader(cfg.data, train=False),
+                           lambda item: item[0], real_dir, target_num)
     _clear_pngs(fake_dir)
 
     print(f"[imagegen] dumping {args.mode} images...")
-    fake_count = 0
+    loader = build_loader(cfg.data, train=False)
     if args.mode == "recon":
-        loader = build_loader(cfg.data, train=False)
-        n = 0
-        for x, _ in loader:
-            if n >= target_num:
-                break
-            rec = model.reconstruct(x.to(device))
-            for img in rec:
-                if n >= target_num:
-                    break
-                save_image((img + 1) / 2, fake_dir / f"{n:06d}.png")
-                n += 1
-        fake_count = n
+        fake_count = _dump(loader, lambda item: model.reconstruct(item[0].to(device)),
+                           fake_dir, target_num)
     else:
-        loader = build_loader(cfg.data, train=False)
-        n = 0
-        while n < target_num:
-            for _, condition in loader:
-                if n >= target_num:
-                    break
-                imgs = model.generate(list(condition), cfg_scale=args.cfg)
-                for img in imgs:
-                    if n >= target_num:
-                        break
-                    save_image((img + 1) / 2, fake_dir / f"{n:06d}.png")
-                    n += 1
-                print(f"\r  {n}/{target_num}", end="", flush=True)
-        print()
-        fake_count = n
+        fake_count = _dump(loader, lambda item: model.generate(list(item[1]), cfg_scale=args.cfg),
+                           fake_dir, target_num, progress=True)
 
     if real_count != target_num or fake_count != target_num:
         raise RuntimeError(

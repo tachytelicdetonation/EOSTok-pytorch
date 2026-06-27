@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import Config
-from ..text import EncodedText
+from ..text import Condition
 from .ar import ARModel
 from .quantizer import IBQQuantizer
 from .tokenizer import Decoder1D, Encoder1D
@@ -53,8 +53,11 @@ class Metrics:
 
 @dataclass
 class ImageGenOutput:
-    """One forward pass, grouped by role so the criterion and the logger each
-    read one group instead of categorising a flat dict by hand."""
+    """One forward pass, grouped by role (pixels / activations / reg_losses /
+    metrics) so each consumer reaches for the group it needs instead of
+    categorising a flat dict by hand. The criterion reads pixels, reg_losses,
+    and activations; the train loop logs pixels.recon and the metrics the
+    criterion returns."""
     pixels: Pixels
     activations: Activations
     reg_losses: RegLosses
@@ -93,7 +96,7 @@ class ImageGen(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        condition: str | list[str] | tuple[str, ...] | EncodedText,
+        condition: Condition,
         keep_tokens: int | None = None,
         condition_drop: torch.Tensor | None = None,
     ) -> ImageGenOutput:
@@ -111,10 +114,9 @@ class ImageGen(nn.Module):
         with torch.no_grad():
             ar_acc = (logits.argmax(-1) == indices).float().mean()
 
-        # --- APR path: decode teacher-forced AR predictions to pixels (Eq. 4)
-        p_ar = logits.softmax(dim=-1)
-        hard_ar = F.one_hot(logits.argmax(-1), logits.shape[-1]).to(p_ar.dtype)
-        ind_ar = hard_ar + p_ar - p_ar.detach()
+        # --- APR path: decode teacher-forced AR predictions to pixels (Eq. 4).
+        # Same straight-through one-hot the quantizer uses on the encoder path.
+        ind_ar, _, _ = self.quantizer.straight_through_onehot(logits)
         z_hat_q = self.quantizer.soft_codes_to_latents(ind_ar)
 
         k = keep_tokens or self.num_latent_tokens
@@ -142,7 +144,7 @@ class ImageGen(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        condition: str | list[str] | tuple[str, ...] | EncodedText,
+        condition: Condition,
         temperature: float = 1.0,
         cfg_scale: float = 1.0,
     ) -> torch.Tensor:

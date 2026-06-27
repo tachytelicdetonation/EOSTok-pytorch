@@ -26,20 +26,25 @@ def _image_transform(cfg: DataConfig, train: bool):
     return transforms.Compose(ops + [transforms.ToTensor(), norm])
 
 
+def load_hf_split(cfg: DataConfig, train: bool):
+    """Open the train/val split of the configured HF image-caption dataset.
+    Single home for the datasets import guard + split selection + hf_config dispatch."""
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError("Install the `datasets` package to load Hugging Face image-caption data.") from exc
+
+    split = cfg.train_split if train else cfg.val_split
+    if cfg.hf_config:
+        return load_dataset(cfg.hf_name, cfg.hf_config, split=split)
+    return load_dataset(cfg.hf_name, split=split)
+
+
 class HFImageCaptionDataset:
     """Thin wrapper over a Hugging Face image-caption dataset."""
 
     def __init__(self, cfg: DataConfig, train: bool, text_cache: CaptionFeatureCache | None = None):
-        try:
-            from datasets import load_dataset
-        except ImportError as exc:
-            raise ImportError("Install the `datasets` package for hf_image_caption data.") from exc
-
-        split = cfg.train_split if train else cfg.val_split
-        if cfg.hf_config:
-            self.ds = load_dataset(cfg.hf_name, cfg.hf_config, split=split)
-        else:
-            self.ds = load_dataset(cfg.hf_name, split=split)
+        self.ds = load_hf_split(cfg, train)
         self.cfg = cfg
         self.transform = _image_transform(cfg, train)
         self.text_cache = text_cache

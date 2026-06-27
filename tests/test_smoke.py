@@ -147,10 +147,12 @@ def test_caption_conditioning():
     assert out.pixels.recon.shape == (4, 1, 32, 32)
     assert out.pixels.apr.shape == (4, 1, 32, 32)
 
+    # Condition dropout now runs through the conditioner's force_empty mask: a
+    # dropped row collapses to the null-token prefix, a kept row keeps its caption.
     drop = torch.tensor([True, False, True, False])
-    dropped = model.ar.drop_condition(captions, drop)
-    assert dropped[0] == ""
-    assert dropped[1] == captions[1]
+    dropped_text = model.ar.text(captions, torch.device("cpu"), force_empty=drop)
+    assert dropped_text.mask[2, 0] and not dropped_text.mask[2, 1:].any()  # dropped -> null
+    assert dropped_text.mask[3, 1:].any()                                  # kept -> real caption
 
     text = model.ar.text(["", "large dog"], torch.device("cpu"))
     assert text.mask.shape == (2, cfg.text.max_length)

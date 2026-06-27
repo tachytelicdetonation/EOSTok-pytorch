@@ -14,6 +14,16 @@ def omits_text_encoder(cfg: Config) -> bool:
     return cfg.text.freeze and not cfg.text.save_encoder_state
 
 
+def _require_savable(cfg: Config):
+    """A trainable text encoder must be saved; otherwise its weights would be
+    lost on save and missing on load. One invariant for both directions."""
+    if not cfg.text.freeze and not cfg.text.save_encoder_state:
+        raise ValueError(
+            "cfg.text.save_encoder_state must be true when cfg.text.freeze is false; "
+            "otherwise trainable text-encoder weights would be lost."
+        )
+
+
 def checkpoint_state_dict(module: nn.Module, cfg: Config) -> dict:
     """State dict for checkpoints.
 
@@ -21,11 +31,7 @@ def checkpoint_state_dict(module: nn.Module, cfg: Config) -> dict:
     By default we save only the trainable caption-conditioning projections and
     AR/image modules so checkpoints do not duplicate a frozen LLM/VLM backbone.
     """
-    if not cfg.text.freeze and not cfg.text.save_encoder_state:
-        raise ValueError(
-            "cfg.text.save_encoder_state must be true when cfg.text.freeze is false; "
-            "otherwise trainable text-encoder weights would be dropped."
-        )
+    _require_savable(cfg)
     state = module.state_dict()
     if not omits_text_encoder(cfg):
         return state
@@ -34,11 +40,7 @@ def checkpoint_state_dict(module: nn.Module, cfg: Config) -> dict:
 
 def load_checkpoint_state(module: nn.Module, state: dict, cfg: Config):
     """Load a model/EMA state, allowing omitted frozen text-encoder weights."""
-    if not cfg.text.freeze and not cfg.text.save_encoder_state:
-        raise ValueError(
-            "cfg.text.save_encoder_state must be true when cfg.text.freeze is false; "
-            "otherwise trainable text-encoder weights would be missing."
-        )
+    _require_savable(cfg)
     if not omits_text_encoder(cfg):
         module.load_state_dict(state)
         return

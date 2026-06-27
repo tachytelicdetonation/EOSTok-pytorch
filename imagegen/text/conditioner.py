@@ -24,35 +24,42 @@ class TextCondition:
 
 @dataclass
 class EncodedText:
-    """Frozen text-encoder outputs before the trainable ImageGen projection."""
+    """Frozen text-encoder outputs before the trainable ImageGen projection.
+
+    Canonical shape is always batched: hidden (B, L, D), mask (B, L). A 2D input
+    (a single row, e.g. from a cache __getitem__) is unsqueezed once at
+    construction, so every method can assume 3D instead of probing the rank."""
 
     hidden: torch.Tensor
     mask: torch.Tensor
 
-    def __len__(self) -> int:
-        return int(self.batched().hidden.shape[0])
-
-    def batched(self) -> "EncodedText":
+    def __post_init__(self):
         if self.hidden.ndim == 2:
-            return EncodedText(self.hidden.unsqueeze(0), self.mask.unsqueeze(0))
-        return self
+            self.hidden = self.hidden.unsqueeze(0)
+            self.mask = self.mask.unsqueeze(0)
+
+    def __len__(self) -> int:
+        return int(self.hidden.shape[0])
 
     def to(self, device: torch.device) -> "EncodedText":
-        batch = self.batched()
         return EncodedText(
-            batch.hidden.to(device=device),
-            batch.mask.to(device=device, dtype=torch.bool),
+            self.hidden.to(device=device),
+            self.mask.to(device=device, dtype=torch.bool),
         )
 
     def take(self, index) -> "EncodedText":
-        batch = self.batched()
-        return EncodedText(batch.hidden[index], batch.mask[index]).batched()
+        # A scalar index yields a 2D row; __post_init__ re-batches it to 3D.
+        return EncodedText(self.hidden[index], self.mask[index])
 
     @staticmethod
     def collate(items: list["EncodedText"]) -> "EncodedText":
-        hidden = torch.stack([item.batched().hidden.squeeze(0) for item in items])
-        mask = torch.stack([item.batched().mask.squeeze(0) for item in items])
+        hidden = torch.stack([item.hidden.squeeze(0) for item in items])
+        mask = torch.stack([item.mask.squeeze(0) for item in items])
         return EncodedText(hidden, mask)
+
+
+Captions = str | list[str] | tuple[str, ...]
+Condition = Captions | EncodedText
 
 
 @dataclass
@@ -99,6 +106,7 @@ class TextConditioner(nn.Module):
         self.max_length = cfg.max_length
         self.use_tiny = cfg.model_name == "__tiny__"
         self.encoder_loaded = load_encoder
+        self._encoder_use_cache: bool | None = None  # probed once in _encode_hidden
 
         if self.use_tiny:
             self.tokenizer = None
@@ -166,7 +174,7 @@ class TextConditioner(nn.Module):
         return cls._hidden_size(config)
 
     @staticmethod
-    def normalize_captions(captions: str | list[str] | tuple[str, ...]) -> list[str]:
+    def normalize_captions(captions: Captions) -> list[str]:
         if isinstance(captions, str):
             return [captions]
         return [str(c) for c in captions]
@@ -179,11 +187,10 @@ class TextConditioner(nn.Module):
             )
 
     def _tokenize(self, captions: list[str], device: torch.device):
+        self._require_encoder()
         if self.use_tiny:
-            self._require_encoder()
             return _TinyTextBackbone.encode(captions, self.max_length, device)
 
-        self._require_encoder()
         batch = self.tokenizer(
             captions,
             padding="max_length",
@@ -202,10 +209,19 @@ class TextConditioner(nn.Module):
             "output_hidden_states": True,
             "return_dict": True,
         }
-        try:
+        # Whether the encoder accepts use_cache is a fixed property of the model;
+        # probe it once via try/except, then branch on the memoized result.
+        if self._encoder_use_cache is True:
             output = self.encoder(**kwargs, use_cache=False)
-        except TypeError:
+        elif self._encoder_use_cache is False:
             output = self.encoder(**kwargs)
+        else:
+            try:
+                output = self.encoder(**kwargs, use_cache=False)
+                self._encoder_use_cache = True
+            except TypeError:
+                output = self.encoder(**kwargs)
+                self._encoder_use_cache = False
 
         if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
             return output.last_hidden_state
@@ -214,7 +230,7 @@ class TextConditioner(nn.Module):
         raise RuntimeError("Text encoder output does not include hidden states")
 
     @torch.no_grad()
-    def encode(self, captions: str | list[str] | tuple[str, ...], device: torch.device) -> EncodedText:
+    def encode(self, captions: Captions, device: torch.device) -> EncodedText:
         """Run only the frozen text encoder and return raw hidden states."""
         captions = self.normalize_captions(captions)
         input_ids, mask = self._tokenize(captions, device)
@@ -247,7 +263,7 @@ class TextConditioner(nn.Module):
 
     def forward(
         self,
-        captions: str | list[str] | tuple[str, ...] | EncodedText,
+        captions: Condition,
         device: torch.device,
         force_empty: torch.Tensor | None = None,
     ) -> TextCondition:
@@ -270,16 +286,8 @@ class TextConditioner(nn.Module):
         else:
             hidden = self._encode_hidden(input_ids, mask)
 
-        hidden = hidden.to(self.token_proj.weight.dtype)
-        text_tokens = self.token_proj(hidden)
-
-        empty = null_caption | ~mask.any(dim=1)
-        if empty.any():
-            mask = mask.clone()
-            text_tokens = text_tokens.clone()
-            mask[empty] = False
-            mask[empty, 0] = True
-            text_tokens[empty] = 0
-            text_tokens[empty, 0] = self.null_token
-
-        return TextCondition(tokens=text_tokens, mask=mask)
+        # Projection + null-token injection live only in _project_encoded. The
+        # empty rows are (empty caption OR force_empty), folded into null_caption
+        # and passed through as force_empty (hidden stays uncast — the projection
+        # path casts once). This is the same null-out the cached path runs.
+        return self._project_encoded(EncodedText(hidden, mask), device, force_empty=null_caption)

@@ -33,11 +33,7 @@ class IBQQuantizer(nn.Module):
         c_n = F.normalize(self.codebook, dim=-1)
 
         logits = torch.einsum("bld,kd->blk", z_n, c_n) / self.temperature
-        p = logits.softmax(dim=-1)
-
-        indices = logits.argmax(dim=-1)
-        hard = F.one_hot(indices, self.codebook_size).to(p.dtype)
-        ind = hard + p - p.detach()  # straight-through, gradients via softmax
+        ind, p, indices = self.straight_through_onehot(logits)
         z_q = torch.einsum("blk,kd->bld", ind, c_n)
 
         commit_loss = F.mse_loss(z_n, z_q.detach()) + 0.25 * F.mse_loss(z_n.detach(), z_q)
@@ -58,6 +54,21 @@ class IBQQuantizer(nn.Module):
             "commit_loss": commit_loss,
             "entropy_loss": entropy_loss,
         }
+
+    def straight_through_onehot(self, logits: torch.Tensor):
+        """Straight-through soft one-hot (Eq. 7) from logits (B, L, K):
+
+            ind = onehot(argmax) + p - stopgrad(p)
+
+        Gradients flow only through the softmax branch. Returns (ind, p, indices)
+        so the entropy regularizer and the dict can reuse p/indices. This is the
+        single home for the STE formulation, shared by the encoder-quantization
+        path (forward) and the AR/APR path (ImageGen.forward)."""
+        p = logits.softmax(dim=-1)
+        indices = logits.argmax(dim=-1)
+        hard = F.one_hot(indices, self.codebook_size).to(p.dtype)
+        ind = hard + p - p.detach()
+        return ind, p, indices
 
     @torch.no_grad()
     def codes_to_latents(self, indices: torch.Tensor) -> torch.Tensor:

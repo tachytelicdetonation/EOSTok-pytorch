@@ -101,17 +101,10 @@ def build_caption_cache(cfg: Config, train: bool, device: torch.device, path: st
     if cfg.data.dataset != "hf_image_caption":
         raise ValueError("Caption feature caching currently supports only hf_image_caption datasets.")
 
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise ImportError("Install the `datasets` package to build caption caches.") from exc
+    from ..data.loader import load_hf_split  # lazy: avoid a text<->data import cycle
 
     split = _split_name(cfg.data, train)
-    if cfg.data.hf_config:
-        ds = load_dataset(cfg.data.hf_name, cfg.data.hf_config, split=split)
-    else:
-        ds = load_dataset(cfg.data.hf_name, split=split)
-
+    ds = load_hf_split(cfg.data, train)
     captions = [str(value) for value in ds[cfg.data.caption_column]]
     conditioner = TextConditioner(cfg.text, cfg.ar.hidden_dim, load_encoder=True).to(device).eval()
     dtype = _cache_dtype(cfg.text.cache_dtype)

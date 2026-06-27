@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import TextConfig
-from ..text import EncodedText, TextCondition, TextConditioner
+from ..text import Condition, EncodedText, TextCondition, TextConditioner
 
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -151,15 +151,32 @@ class ARModel(nn.Module):
         self.norm_f = nn.RMSNorm(dim)
         self.head = nn.Linear(dim, codebook_size, bias=False)
 
-    @staticmethod
-    def null_condition(condition: str | list[str] | tuple[str, ...]) -> list[str]:
-        captions = TextConditioner.normalize_captions(condition)
-        return [""] * len(captions)
+    def _cfg_double(self, condition: Condition, cfg_scale: float):
+        """Build the classifier-free-guidance batch: duplicate the condition into
+        [conditional; unconditional] halves and return a force_empty mask marking
+        the unconditional half (which the conditioner collapses to the learned
+        null token). cfg off -> (condition, None).
 
-    @staticmethod
-    def drop_condition(condition: str | list[str] | tuple[str, ...], drop: torch.Tensor) -> list[str]:
-        captions = TextConditioner.normalize_captions(condition)
-        return ["" if bool(should_drop) else caption for caption, should_drop in zip(captions, drop)]
+        This is the single mechanism for "make this row unconditional", shared by
+        cached EncodedText and live captions, replacing the old caption-rewrite
+        path and the separate cached force_empty path with one route."""
+        if cfg_scale == 1.0:
+            return condition, None
+        if isinstance(condition, EncodedText):
+            n = condition.hidden.shape[0]
+            doubled = EncodedText(
+                torch.cat([condition.hidden, condition.hidden], dim=0),
+                torch.cat([condition.mask, condition.mask], dim=0),
+            )
+        else:
+            captions = TextConditioner.normalize_captions(condition)
+            n = len(captions)
+            doubled = captions + captions
+        force_empty = torch.cat([
+            torch.zeros(n, dtype=torch.bool, device=self.pos_emb.device),
+            torch.ones(n, dtype=torch.bool, device=self.pos_emb.device),
+        ])
+        return doubled, force_empty
 
     def embed_soft(self, ind: torch.Tensor) -> torch.Tensor:
         """Soft token embedding h = Ind^T Embed (differentiable into the tokenizer)."""
@@ -234,7 +251,7 @@ class ARModel(nn.Module):
     def forward(
         self,
         tok_embs: torch.Tensor,
-        condition: str | list[str] | tuple[str, ...] | EncodedText,
+        condition: Condition,
         condition_drop: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Teacher-forced forward.
@@ -253,42 +270,25 @@ class ARModel(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        condition: str | list[str] | tuple[str, ...] | EncodedText,
+        condition: Condition,
         temperature: float = 1.0,
         cfg_scale: float = 1.0,
     ) -> torch.Tensor:
         """Sample (B, L) code indices.
 
-        CFG uses the same prefix-AR path with an empty text prefix as the
-        unconditional branch: l_g = l_u + s * (l_c - l_u).
+        CFG uses the same prefix-AR path with a null-token prefix as the
+        unconditional branch: l_g = l_u + s * (l_c - l_u). `_cfg_double` builds
+        the [conditional; unconditional] batch through one force_empty mechanism
+        for both cached EncodedText and live captions.
         """
-        if isinstance(condition, EncodedText):
-            encoded = condition.to(self.pos_emb.device)
-            base_batch = encoded.hidden.shape[0]
-            if cfg_scale != 1.0:
-                encoded = EncodedText(
-                    torch.cat([encoded.hidden, encoded.hidden], dim=0),
-                    torch.cat([encoded.mask, encoded.mask], dim=0),
-                )
-                force_empty = torch.cat([
-                    torch.zeros(base_batch, dtype=torch.bool, device=self.pos_emb.device),
-                    torch.ones(base_batch, dtype=torch.bool, device=self.pos_emb.device),
-                ])
-            else:
-                force_empty = None
-            text = self.text(encoded, self.pos_emb.device, force_empty)
-        else:
-            captions = TextConditioner.normalize_captions(condition)
-            use_cfg = cfg_scale != 1.0
-            if use_cfg:
-                captions = captions + self.null_condition(captions)
-            text = self.text(captions, self.pos_emb.device)
-
+        device = self.pos_emb.device
         use_cfg = cfg_scale != 1.0
+        doubled, force_empty = self._cfg_double(condition, cfg_scale)
+        text = self.text(doubled, device, force_empty)
+
         batch = text.tokens.shape[0]
         tokens = []
         dtype = self.tok_emb.weight.dtype
-        device = self.pos_emb.device
 
         text_x = self._add_pos(text.tokens.to(dtype=dtype), 0)
         key_mask = text.mask
