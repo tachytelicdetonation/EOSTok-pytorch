@@ -156,26 +156,6 @@ ConditionInput = Captions | EncodedText
 Condition = ConditionInput | PreparedCondition
 
 
-def normalize_condition(condition: ConditionInput) -> ConditionInput:
-    if isinstance(condition, EncodedText):
-        return condition
-    return TextConditioner.normalize_captions(condition)
-
-
-def condition_len(condition: ConditionInput | PreparedCondition) -> int:
-    if isinstance(condition, (EncodedText, PreparedCondition)):
-        return len(condition)
-    return len(TextConditioner.normalize_captions(condition))
-
-
-def condition_take(
-    condition: ConditionInput | PreparedCondition, index
-) -> ConditionInput | PreparedCondition:
-    if isinstance(condition, (EncodedText, PreparedCondition)):
-        return condition.take(index)
-    return TextConditioner.normalize_captions(condition)[index]
-
-
 @dataclass
 class _EncoderOutput:
     last_hidden_state: torch.Tensor
@@ -221,8 +201,6 @@ class TextConditioner(nn.Module):
         self.out_dim = out_dim
         self.max_length = cfg.max_length
         self.use_tiny = cfg.model_name == "__tiny__"
-        self.encoder_loaded = load_encoder
-        self._encoder_use_cache: bool | None = None  # probed once in _encode_hidden
 
         if self.use_tiny:
             self.tokenizer = None
@@ -274,13 +252,6 @@ class TextConditioner(nn.Module):
         super().train(mode)
         if self.cfg.freeze and self.encoder is not None:
             self.encoder.eval()
-        return self
-
-    def unload_encoder(self):
-        """Drop the live text encoder/tokenizer after cached captions exist."""
-        self.encoder = None
-        self.tokenizer = None
-        self.encoder_loaded = False
         return self
 
     @staticmethod
@@ -348,19 +319,12 @@ class TextConditioner(nn.Module):
         }
         encoder = self.encoder
         assert encoder is not None
-        # Whether the encoder accepts use_cache is a fixed property of the model;
-        # probe it once via try/except, then branch on the memoized result.
-        if self._encoder_use_cache:
+        # Some encoders accept use_cache (and warn without it), others reject the
+        # kwarg; a forward dwarfs the retry, so just try-with then fall back.
+        try:
             output = encoder(**kwargs, use_cache=False)
-        elif self._encoder_use_cache is not None:
+        except TypeError:
             output = encoder(**kwargs)
-        else:
-            try:
-                output = encoder(**kwargs, use_cache=False)
-                self._encoder_use_cache = True
-            except TypeError:
-                output = encoder(**kwargs)
-                self._encoder_use_cache = False
 
         if (
             hasattr(output, "last_hidden_state")

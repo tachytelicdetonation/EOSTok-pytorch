@@ -26,12 +26,7 @@ from ..config import Config, load_config
 from ..data import build_loader
 from ..models import ImageGen
 from ..objectives import Adversary, ImageGenCriterion
-from ..text import (
-    condition_len,
-    condition_take,
-    ensure_caption_cache,
-    normalize_condition,
-)
+from ..text import EncodedText, ensure_caption_cache
 from .checkpoint import checkpoint_state_dict, load_checkpoint_state
 from .ema import EMA
 
@@ -236,11 +231,17 @@ def main():
                 done = True
                 break
             x = x.to(device, non_blocking=True)
-            condition = normalize_condition(condition)
-            batch_conditions = condition_len(condition)
+            # The loader yields list[str] captions or a batched EncodedText; the
+            # model normalizes either on its own, so the loop only needs the batch
+            # size and a stable <=32-row slice for sampling. EncodedText slices via
+            # .take(); a caption list slices directly.
+            batch_conditions = len(condition)
             if fixed_conditions is None:
-                fixed_conditions = condition_take(
-                    condition, slice(0, min(32, batch_conditions))
+                head = slice(0, min(32, batch_conditions))
+                fixed_conditions = (
+                    condition.take(head)
+                    if isinstance(condition, EncodedText)
+                    else condition[head]
                 )
 
             # Condition dropout for CFG: force_empty marks the dropped rows, which
