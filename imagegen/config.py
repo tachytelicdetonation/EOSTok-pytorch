@@ -19,6 +19,7 @@ class DataConfig:
     num_workers: int = 2
     hf_name: str = ""
     hf_config: str | None = None
+    revision: str | None = None  # pin a dataset commit/tag to freeze content + order
     train_split: str = "train"
     val_split: str = "validation"
     image_column: str = "image"
@@ -28,6 +29,7 @@ class DataConfig:
 @dataclass
 class TextConfig:
     model_name: str = "Qwen/Qwen3.5-0.8B"
+    revision: str | None = None  # pin an encoder commit/tag so cached features can't silently drift
     max_length: int = 128
     freeze: bool = True
     trust_remote_code: bool = False

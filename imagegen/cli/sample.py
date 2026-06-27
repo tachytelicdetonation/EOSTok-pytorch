@@ -19,14 +19,33 @@ from torchvision.utils import save_image
 
 from ..config import load_config
 from ..models import ImageGen
-from ..training.checkpoint import load_checkpoint_state
+from ..training.checkpoint import TEXT_ENCODER_PREFIX, load_checkpoint_state
 from ..training.train_loop import pick_device
 
 
-def load_ema_model(cfg, ckpt_path: str, device: torch.device) -> ImageGen:
-    model = ImageGen(cfg).to(device).eval()
+def load_ema_model(
+    cfg, ckpt_path: str, device: torch.device, load_text_encoder: bool = True
+) -> ImageGen:
+    """Load EMA weights into an ImageGen.
+
+    Pass ``load_text_encoder=False`` for paths that never touch the AR/text stack
+    (e.g. rFID reconstruction): the live text encoder is then never constructed,
+    so the metric stays local/offline. The projection's input size is recovered
+    from the checkpoint (``ar.text.token_proj.weight`` is ``(out_dim, encoder_dim)``
+    and always kept), so no encoder config download is needed to size it.
+    """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    load_checkpoint_state(model, ckpt["ema"], cfg)
+    state = ckpt["ema"]
+    text_encoder_dim = None
+    if not load_text_encoder:
+        text_encoder_dim = state["ar.text.token_proj.weight"].shape[1]
+        # Drop any saved encoder weights so a strict load matches the encoder-less
+        # model (no-op for the default frozen-and-omitted checkpoints).
+        state = {k: v for k, v in state.items() if not k.startswith(TEXT_ENCODER_PREFIX)}
+    model = ImageGen(
+        cfg, load_text_encoder=load_text_encoder, text_encoder_dim=text_encoder_dim
+    ).to(device).eval()
+    load_checkpoint_state(model, state, cfg)
     return model
 
 

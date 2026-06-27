@@ -36,8 +36,8 @@ def load_hf_split(cfg: DataConfig, train: bool):
 
     split = cfg.train_split if train else cfg.val_split
     if cfg.hf_config:
-        return load_dataset(cfg.hf_name, cfg.hf_config, split=split)
-    return load_dataset(cfg.hf_name, split=split)
+        return load_dataset(cfg.hf_name, cfg.hf_config, split=split, revision=cfg.revision)
+    return load_dataset(cfg.hf_name, split=split, revision=cfg.revision)
 
 
 class HFImageCaptionDataset:

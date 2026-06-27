@@ -73,7 +73,9 @@ def main():
 
     cfg = load_config(args.config)
     device = pick_device(cfg.device)
-    model = load_ema_model(cfg, args.ckpt, device)
+    # recon only runs encoder->quantizer->decoder, so skip loading the live text
+    # encoder; gen samples from captions and needs it.
+    model = load_ema_model(cfg, args.ckpt, device, load_text_encoder=args.mode != "recon")
 
     val_count = len(build_dataset(cfg.data, train=False))
     target_num = min(args.num, val_count)

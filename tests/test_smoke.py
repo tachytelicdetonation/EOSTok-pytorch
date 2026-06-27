@@ -282,6 +282,39 @@ def test_cached_text_without_live_encoder():
     print("cached text without live encoder OK")
 
 
+def test_caption_fingerprint_detects_reorder():
+    """Issue-1 guard: the row hash must change on content OR order drift (the
+    silent-corruption case the config-identity key can't see)."""
+    from imagegen.text.cache import _caption_fingerprint
+
+    captions = ["small dog", "large dog", "a cat"]
+    assert _caption_fingerprint(captions) == _caption_fingerprint(list(captions))  # stable
+    assert _caption_fingerprint(captions) != _caption_fingerprint(captions[::-1])  # order
+    assert _caption_fingerprint(captions) != _caption_fingerprint(captions[:2])    # content
+    print("caption fingerprint reorder/content detection OK")
+
+
+def test_load_ema_model_recon_skips_text_encoder():
+    """Issue-2 guard: a recon load reconstructs without ever building the live
+    text encoder, sizing the projection straight from the checkpoint."""
+    import tempfile
+    from pathlib import Path
+
+    from imagegen.cli.sample import load_ema_model
+
+    cfg = tiny_config()
+    model = ImageGen(cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = Path(tmp) / "ema.ckpt"
+        torch.save({"ema": checkpoint_state_dict(model, cfg)}, ckpt_path)
+        recon_model = load_ema_model(cfg, str(ckpt_path), torch.device("cpu"),
+                                     load_text_encoder=False)
+    assert recon_model.ar.text.encoder is None
+    rec = recon_model.reconstruct(torch.randn(2, 1, 32, 32))
+    assert rec.shape == (2, 1, 32, 32)
+    print("load_ema_model recon skips text encoder OK")
+
+
 def test_trainable_text_encoder_must_be_saved():
     cfg = tiny_config()
     cfg.text.freeze = False
@@ -307,5 +340,7 @@ if __name__ == "__main__":
     test_imagewoof_config_defaults()
     test_checkpoint_filters_frozen_text_encoder()
     test_cached_text_without_live_encoder()
+    test_caption_fingerprint_detects_reorder()
+    test_load_ema_model_recon_skips_text_encoder()
     test_trainable_text_encoder_must_be_saved()
     print("all smoke tests passed")

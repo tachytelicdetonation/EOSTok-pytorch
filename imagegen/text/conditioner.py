@@ -119,12 +119,14 @@ class TextConditioner(nn.Module):
 
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     cfg.model_name,
+                    revision=cfg.revision,
                     trust_remote_code=cfg.trust_remote_code,
                 )
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                 self.encoder = AutoModel.from_pretrained(
                     cfg.model_name,
+                    revision=cfg.revision,
                     trust_remote_code=cfg.trust_remote_code,
                 )
                 encoder_dim = self._hidden_size(self.encoder.config)
@@ -169,6 +171,7 @@ class TextConditioner(nn.Module):
 
         config = AutoConfig.from_pretrained(
             cfg.model_name,
+            revision=cfg.revision,
             trust_remote_code=cfg.trust_remote_code,
         )
         return cls._hidden_size(config)
