@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..config import Config
+
 
 class PatchDiscriminator(nn.Module):
     def __init__(self, channels: int = 3, base: int = 64, n_layers: int = 3):
@@ -44,7 +46,7 @@ def hinge_g_loss(fake_logits: torch.Tensor) -> torch.Tensor:
 
 class LeCamRegularizer(nn.Module):
     """LeCam divergence (Tseng et al., 2021): anchors D outputs to EMA of the
-    opposite class, preventing the discriminator from drifting too far ahead."""
+    opposite side, preventing the discriminator from drifting too far ahead."""
 
     def __init__(self, decay: float = 0.99):
         super().__init__()
@@ -58,3 +60,34 @@ class LeCamRegularizer(nn.Module):
             self.ema_fake.mul_(self.decay).add_(fake_logits.mean() * (1 - self.decay))
         return ((real_logits - self.ema_fake).pow(2).mean()
                 + (fake_logits - self.ema_real).pow(2).mean())
+
+
+class Adversary(nn.Module):
+    """Discriminator + LeCam + the ``disc_start`` gate.
+
+    ``active(step)`` is the single source of truth for whether the GAN is on.
+    The generator term keeps fake images live, while the discriminator-side
+    loss detaches them so discriminator gradients never reach the generator.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.disc = PatchDiscriminator(cfg.data.channels)
+        self.lecam = LeCamRegularizer()
+        self.gan_weight = cfg.loss.gan
+        self.lecam_weight = cfg.loss.lecam
+        self.disc_start = cfg.loss.disc_start
+
+    def active(self, step: int) -> bool:
+        return self.gan_weight > 0 and step >= self.disc_start
+
+    def g_term(self, fake: torch.Tensor, step: int) -> torch.Tensor:
+        if not self.active(step):
+            return fake.new_zeros(())
+        return hinge_g_loss(self.disc(fake))
+
+    def d_loss(self, real: torch.Tensor, fake: torch.Tensor, step: int) -> torch.Tensor:
+        real_logits = self.disc(real)
+        fake_logits = self.disc(fake.detach())
+        return hinge_d_loss(real_logits, fake_logits) \
+            + self.lecam_weight * self.lecam(real_logits, fake_logits)

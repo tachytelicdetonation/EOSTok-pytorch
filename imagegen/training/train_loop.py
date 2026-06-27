@@ -1,4 +1,4 @@
-"""Single-stage end-to-end training of EOSTok (Eq. 8):
+"""Single-stage ImageGen training loop.
 
   L = L_VQVAE + lambda_NTP * L_NTP + lambda_APR * L_APR
       + lambda_sem * (L_implicit + L_decoder_align)
@@ -6,7 +6,7 @@
 with L_VQVAE = L2 + LPIPS + lambda_GAN * L_GAN + lambda_reg * L_reg.
 
 Usage:
-  python -m eostok.train --config configs/mnist.yaml [--max-steps N]
+  python -m imagegen.cli.train --config configs/imagewoof_64.yaml [--max-steps N]
 """
 
 from __future__ import annotations
@@ -20,11 +20,13 @@ from pathlib import Path
 import torch
 from torchvision.utils import save_image
 
-from .config import Config, load_config
-from .criterion import Adversary, EOSTokCriterion
-from .data import build_loader
+from ..config import Config, load_config
+from ..data import build_loader
+from ..models import ImageGen
+from ..objectives import Adversary, ImageGenCriterion
+from ..text import EncodedText, ensure_caption_cache
+from .checkpoint import checkpoint_state_dict, load_checkpoint_state
 from .ema import EMA
-from .models import EOSTok
 
 
 def pick_device(name: str) -> torch.device:
@@ -64,6 +66,10 @@ def main():
     ap.add_argument("--max-steps", type=int, default=None,
                     help="Stop early (overrides epochs); useful for smoke tests")
     ap.add_argument("--resume", type=str, default=None)
+    ap.add_argument("--text-cache", choices=["auto", "on", "off"], default="auto",
+                    help="Precompute frozen text-encoder caption features for dataset splits")
+    ap.add_argument("--rebuild-text-cache", action="store_true",
+                    help="Rebuild cached caption features even if a matching cache exists")
     args = ap.parse_args()
 
     cfg: Config = load_config(args.config)
@@ -74,19 +80,47 @@ def main():
     dtype = amp_dtype(cfg.amp, device)
     out_dir = Path(cfg.train.out_dir)
     (out_dir / "samples").mkdir(parents=True, exist_ok=True)
-    print(f"[eostok] device={device} amp={dtype} out={out_dir}")
+    print(f"[imagegen] device={device} amp={dtype} out={out_dir}")
 
-    loader = build_loader(cfg.data, train=True)
+    cache_requested = (
+        args.text_cache == "on"
+        or (args.text_cache == "auto" and cfg.text.freeze and cfg.text.cache_dataset)
+    )
+    if cache_requested and not cfg.text.freeze:
+        raise ValueError("Text cache requires cfg.text.freeze=true; trainable encoders must stay live.")
+
+    train_text_cache = None
+    val_text_cache = None
+    text_encoder_dim = None
+    if cache_requested:
+        print("[imagegen] preparing frozen text-encoder caption caches")
+        train_text_cache = ensure_caption_cache(cfg, train=True, device=device,
+                                                rebuild=args.rebuild_text_cache)
+        val_text_cache = ensure_caption_cache(cfg, train=False, device=device,
+                                              rebuild=args.rebuild_text_cache)
+        if train_text_cache.encoder_dim != val_text_cache.encoder_dim:
+            raise ValueError("Train/validation text caches have different encoder dimensions.")
+        text_encoder_dim = train_text_cache.encoder_dim
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print(f"[imagegen] text cache ready: train={len(train_text_cache)} "
+              f"val={len(val_text_cache)} dim={text_encoder_dim}")
+
+    loader = build_loader(cfg.data, train=True, text_cache=train_text_cache)
     steps_per_epoch = len(loader)
     total_steps = args.max_steps or cfg.train.epochs * steps_per_epoch
 
-    model = EOSTok(cfg).to(device)
+    model = ImageGen(
+        cfg,
+        load_text_encoder=train_text_cache is None,
+        text_encoder_dim=text_encoder_dim,
+    ).to(device)
     # The objective, as two sibling modules (opposed optimizers).
     adversary = Adversary(cfg).to(device)
-    criterion = EOSTokCriterion(cfg, adversary).to(device)
+    criterion = ImageGenCriterion(cfg, adversary).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[eostok] model params: {n_params / 1e6:.1f}M "
+    print(f"[imagegen] model params: {n_params / 1e6:.1f}M "
           f"(tokenizer {sum(p.numel() for m in (model.encoder, model.decoder, model.quantizer) for p in m.parameters()) / 1e6:.1f}M, "
           f"AR {sum(p.numel() for p in model.ar.parameters()) / 1e6:.1f}M)")
 
@@ -97,7 +131,7 @@ def main():
                   + list(model.decoder.parameters())
                   + list(model.quantizer.parameters())
                   + [p for p in criterion.parameters() if p.requires_grad])
-    ar_params = list(model.ar.parameters())
+    ar_params = [p for p in model.ar.parameters() if p.requires_grad]
     tc = cfg.train
     opt_g = torch.optim.Adam([
         {"params": tok_params, "betas": (tc.beta1, tc.beta2_tokenizer)},
@@ -107,43 +141,65 @@ def main():
     opt_d = torch.optim.Adam(adversary.parameters(), lr=tc.disc_lr,
                              betas=(tc.beta1, tc.beta2_tokenizer))
 
-    ema = EMA(model, tc.ema_decay)
+    ema_shadow = None
+    if train_text_cache is not None:
+        ema_shadow = ImageGen(
+            cfg,
+            load_text_encoder=False,
+            text_encoder_dim=text_encoder_dim,
+        ).to(device)
+        load_checkpoint_state(ema_shadow, checkpoint_state_dict(model, cfg), cfg)
+    ema = EMA(model, tc.ema_decay, shadow=ema_shadow)
 
     def checkpoint() -> dict:
         return {
-            "model": model.state_dict(), "adversary": adversary.state_dict(),
-            "criterion": criterion.state_dict(), "ema": ema.state_dict(),
+            "model": checkpoint_state_dict(model, cfg), "adversary": adversary.state_dict(),
+            "criterion": criterion.state_dict(), "ema": checkpoint_state_dict(ema.shadow, cfg),
             "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(), "step": step,
         }
 
     step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt["model"])
+        load_checkpoint_state(model, ckpt["model"], cfg)
         adversary.load_state_dict(ckpt["adversary"])
         criterion.load_state_dict(ckpt["criterion"])
-        ema.load_state_dict(ckpt["ema"])
+        load_checkpoint_state(ema.shadow, ckpt["ema"], cfg)
         opt_g.load_state_dict(ckpt["opt_g"])
         opt_d.load_state_dict(ckpt["opt_d"])
         step = ckpt["step"]
-        print(f"[eostok] resumed from {args.resume} at step {step}")
+        print(f"[imagegen] resumed from {args.resume} at step {step}")
 
     L = cfg.tokenizer.num_latent_tokens
-    fixed_labels = torch.arange(cfg.data.num_classes, device=device).repeat(8)[:64]
+    fixed_conditions = None
+    if val_text_cache is not None and len(val_text_cache) > 0:
+        g = torch.Generator().manual_seed(cfg.seed)
+        count = min(32, len(val_text_cache))
+        fixed_conditions = val_text_cache.take(torch.randperm(len(val_text_cache), generator=g)[:count])
 
     model.train()
     done = False
     t0 = time.time()
     while not done:
-        for x, y in loader:
+        for x, condition in loader:
             if step >= total_steps:
                 done = True
                 break
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            x = x.to(device, non_blocking=True)
+            if isinstance(condition, EncodedText):
+                condition_in = condition
+                if fixed_conditions is None:
+                    fixed_conditions = condition.take(slice(0, min(32, condition.hidden.shape[0])))
+            else:
+                condition = list(condition)
+                if fixed_conditions is None:
+                    fixed_conditions = condition[:32]
 
-            # Class dropout for CFG: replace with the null class.
-            drop = torch.rand(y.shape, device=device) < cfg.ar.class_dropout
-            y_in = torch.where(drop, torch.full_like(y, model.ar.null_class), y)
+            # Condition dropout for CFG: replace captions with the null caption.
+            drop = torch.rand(len(condition), device=device) < cfg.ar.condition_dropout
+            condition_drop = drop if isinstance(condition, EncodedText) else None
+            if not isinstance(condition, EncodedText):
+                condition_in = model.ar.drop_condition(condition, drop)
 
             lr = cosine_lr(step, total_steps, tc.lr, tc.min_lr)
             for group in opt_g.param_groups:
@@ -154,7 +210,7 @@ def main():
             ctx = (torch.autocast(device.type, dtype=dtype)
                    if dtype else torch.autocast(device.type, enabled=False))
             with ctx:
-                out = model(x, y_in, keep_tokens=k)
+                out = model(x, condition_in, keep_tokens=k, condition_drop=condition_drop)
                 loss, m = criterion(out, x, step)
 
             opt_g.zero_grad(set_to_none=True)
@@ -190,7 +246,13 @@ def main():
                 with torch.no_grad():
                     grid_x = x[:32]
                     rec = ema.shadow.reconstruct(grid_x)
-                    gen = ema.shadow.generate(fixed_labels[:32])
+                    if isinstance(fixed_conditions, EncodedText):
+                        sample_conditions = fixed_conditions.take(
+                            slice(0, min(32, len(fixed_conditions)))
+                        )
+                    else:
+                        sample_conditions = fixed_conditions[:32]
+                    gen = ema.shadow.generate(sample_conditions)
                 save_image((torch.cat([grid_x, rec]) + 1) / 2,
                            out_dir / "samples" / f"recon_{step:07d}.png", nrow=8)
                 save_image((gen + 1) / 2,
@@ -203,7 +265,7 @@ def main():
             step += 1
 
     torch.save(checkpoint(), out_dir / "last.ckpt")
-    print(f"[eostok] done at step {step}; checkpoint -> {out_dir / 'last.ckpt'}")
+    print(f"[imagegen] done at step {step}; checkpoint -> {out_dir / 'last.ckpt'}")
 
 
 if __name__ == "__main__":

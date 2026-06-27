@@ -1,4 +1,4 @@
-"""Typed configuration loaded from YAML. Field defaults follow EOSTok Table 9."""
+"""Typed configuration loaded from YAML."""
 
 from __future__ import annotations
 
@@ -11,13 +11,31 @@ import yaml
 
 @dataclass
 class DataConfig:
-    dataset: str = "mnist"  # "mnist" | "imagefolder"
+    dataset: str = "hf_image_caption"
     root: str = "./data"
-    image_size: int = 32
-    channels: int = 1
-    num_classes: int = 10
+    image_size: int = 64
+    channels: int = 3
     batch_size: int = 128
     num_workers: int = 2
+    hf_name: str = ""
+    hf_config: str | None = None
+    train_split: str = "train"
+    val_split: str = "validation"
+    image_column: str = "image"
+    caption_column: str = "caption"
+
+
+@dataclass
+class TextConfig:
+    model_name: str = "Qwen/Qwen3.5-0.8B"
+    max_length: int = 128
+    freeze: bool = True
+    trust_remote_code: bool = False
+    save_encoder_state: bool = False
+    cache_dataset: bool = True
+    cache_dir: str = "data/text_cache"
+    cache_batch_size: int = 64
+    cache_dtype: str = "float16"
 
 
 @dataclass
@@ -44,7 +62,7 @@ class ARConfig:
     layers: int = 4
     hidden_dim: int = 256
     num_heads: int = 4
-    class_dropout: float = 0.1
+    condition_dropout: float = 0.1
 
 
 @dataclass
@@ -58,14 +76,14 @@ class VFMConfig:
 @dataclass
 class LossConfig:
     recon_l2: float = 1.0
-    recon_lpips: float = 1.0
-    gan: float = 0.1
+    recon_lpips: float = 0.0
+    gan: float = 0.0
     lecam: float = 0.05
     apr_l2: float = 1.0
-    apr_lpips: float = 1.0
+    apr_lpips: float = 0.0
     ntp: float = 0.1
     disc_start: int = 0  # generator sees GAN loss only after this step
-    lpips_enabled: bool = True
+    lpips_enabled: bool = False
 
 
 @dataclass
@@ -88,11 +106,12 @@ class TrainConfig:
 
 @dataclass
 class Config:
-    run_name: str = "eostok"
+    run_name: str = "imagegen"
     seed: int = 42
     device: str = "auto"  # auto | cuda | mps | cpu
     amp: str = "auto"  # auto (bf16 on cuda, off elsewhere) | bf16 | off
     data: DataConfig = field(default_factory=DataConfig)
+    text: TextConfig = field(default_factory=TextConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     quantizer: QuantizerConfig = field(default_factory=QuantizerConfig)
     ar: ARConfig = field(default_factory=ARConfig)

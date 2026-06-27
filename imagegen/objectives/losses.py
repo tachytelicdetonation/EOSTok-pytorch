@@ -1,5 +1,4 @@
-"""Perceptual loss wrapper. LPIPS (VGG backbone, as in the paper) with
-grayscale handling for small datasets like MNIST."""
+"""Perceptual loss wrapper. LPIPS uses the VGG backbone as in the paper."""
 
 from __future__ import annotations
 

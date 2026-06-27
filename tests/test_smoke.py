@@ -6,16 +6,19 @@ Run:  python tests/test_smoke.py
 import torch
 import torch.nn.functional as F
 
-from eostok.config import Config
-from eostok.criterion import Adversary, EOSTokCriterion
-from eostok.models import EOSTok
+from imagegen.config import Config, load_config
+from imagegen.models import ImageGen
+from imagegen.objectives import Adversary, ImageGenCriterion
+from imagegen.training.checkpoint import checkpoint_state_dict, load_checkpoint_state
+from imagegen.training.ema import EMA
 
 
 def tiny_config() -> Config:
     cfg = Config()
     cfg.data.image_size = 32
     cfg.data.channels = 1
-    cfg.data.num_classes = 10
+    cfg.text.model_name = "__tiny__"
+    cfg.text.max_length = 16
     cfg.tokenizer.patch_size = 8  # 4x4 = 16 patches, fast
     cfg.tokenizer.hidden_dim = 64
     cfg.tokenizer.enc_layers = 2
@@ -32,11 +35,11 @@ def tiny_config() -> Config:
 
 def test_forward_shapes_and_grads():
     cfg = tiny_config()
-    model = EOSTok(cfg)
+    model = ImageGen(cfg)
     x = torch.randn(4, 1, 32, 32)
-    y = torch.randint(0, 10, (4,))
+    captions = ["small dog", "large dog", "dog outside", "dog portrait"]
 
-    out = model(x, y, keep_tokens=5)
+    out = model(x, captions, keep_tokens=5)
     assert out.pixels.recon.shape == (4, 1, 32, 32)
     assert out.pixels.apr.shape == (4, 1, 32, 32)
     assert out.metrics.indices.shape == (4, 8)
@@ -56,13 +59,109 @@ def test_forward_shapes_and_grads():
 
 def test_generation():
     cfg = tiny_config()
-    model = EOSTok(cfg).eval()
-    labels = torch.randint(0, 10, (3,))
-    imgs = model.generate(labels)
+    model = ImageGen(cfg).eval()
+    captions = ["small dog", "large dog", "dog outside"]
+    imgs = model.generate(captions)
     assert imgs.shape == (3, 1, 32, 32)
-    imgs_cfg = model.generate(labels, cfg_scale=2.0)
+    imgs_cfg = model.generate(captions, cfg_scale=2.0)
     assert imgs_cfg.shape == (3, 1, 32, 32)
     print("generation (incl. CFG) OK")
+
+
+def test_cached_generation_logits_match_full_prefix():
+    cfg = tiny_config()
+    model = ImageGen(cfg).eval()
+    captions = ["small dog", "large dog"]
+    text = model.ar.text(captions, torch.device("cpu"))
+    fixed_tokens = torch.arange(6).reshape(2, 3) % cfg.quantizer.codebook_size
+
+    dtype = model.ar.tok_emb.weight.dtype
+    key_mask = text.mask
+    text_x = model.ar._add_pos(text.tokens.to(dtype=dtype), 0)
+    _, caches = model.ar._run_cached(text_x, key_mask)
+    step_x = model.ar.img_start.to(dtype=dtype).view(1, 1, -1).expand(2, 1, -1)
+
+    cached_logits = []
+    full_logits = []
+    for step in range(fixed_tokens.shape[1]):
+        step_x = model.ar._add_pos(step_x, key_mask.shape[1])
+        step_key_mask = torch.cat([
+            key_mask,
+            torch.ones((2, 1), dtype=torch.bool),
+        ], dim=1)
+        h_cached, caches = model.ar._run_cached(step_x, step_key_mask, caches)
+        cached_logits.append(model.ar.head(model.ar.norm_f(h_cached[:, -1])))
+
+        if step == 0:
+            visual_in = model.ar.img_start.to(dtype=dtype).view(1, 1, -1).expand(2, 1, -1)
+        else:
+            prev = model.ar.tok_emb(fixed_tokens[:, :step])
+            start = model.ar.img_start.to(dtype=dtype).view(1, 1, -1).expand(2, 1, -1)
+            visual_in = torch.cat([start, prev], dim=1)
+        x, full_key_mask, text_len = model.ar._prefix_sequence(text, visual_in)
+        h_full = model.ar._run(x, full_key_mask)
+        full_logits.append(model.ar.head(h_full[:, text_len + visual_in.shape[1] - 1]))
+
+        key_mask = step_key_mask
+        if step < fixed_tokens.shape[1] - 1:
+            step_x = model.ar.tok_emb(fixed_tokens[:, step]).unsqueeze(1)
+
+    for cached, full in zip(cached_logits, full_logits):
+        assert torch.allclose(cached, full, atol=1e-5, rtol=1e-4)
+    print("cached generation logits match full prefix OK")
+
+
+def test_generation_prefills_text_then_steps_visual_cache():
+    cfg = tiny_config()
+    model = ImageGen(cfg).eval()
+    seen = []
+    first_block = model.ar.blocks[0]
+    original_forward_cached = first_block.forward_cached
+
+    def wrapped_forward_cached(x, key_mask, kv_cache=None):
+        seen.append((x.shape[1], key_mask.shape[1], kv_cache is None))
+        return original_forward_cached(x, key_mask, kv_cache)
+
+    def fail_full_run(*_, **__):
+        raise AssertionError("generation should use the cached path")
+
+    first_block.forward_cached = wrapped_forward_cached
+    model.ar._run = fail_full_run
+
+    tokens = model.ar.generate(["small dog", "large dog"], cfg_scale=2.0)
+
+    expected = [(cfg.text.max_length, cfg.text.max_length, True)]
+    expected.extend((1, cfg.text.max_length + step + 1, False) for step in range(model.ar.seq_len))
+    assert seen == expected
+    assert tokens.shape == (2, model.ar.seq_len)
+    print("generation cache structure OK")
+
+
+def test_caption_conditioning():
+    cfg = tiny_config()
+    model = ImageGen(cfg)
+    x = torch.randn(4, 1, 32, 32)
+    captions = ["", "large dog", "dog outside", "dog portrait"]
+
+    out = model(x, captions, keep_tokens=5)
+    assert out.pixels.recon.shape == (4, 1, 32, 32)
+    assert out.pixels.apr.shape == (4, 1, 32, 32)
+
+    drop = torch.tensor([True, False, True, False])
+    dropped = model.ar.drop_condition(captions, drop)
+    assert dropped[0] == ""
+    assert dropped[1] == captions[1]
+
+    text = model.ar.text(["", "large dog"], torch.device("cpu"))
+    assert text.mask.shape == (2, cfg.text.max_length)
+    assert text.mask[0, 0]
+    assert not text.mask[0, 1:].any()
+    assert text.tokens.shape == (2, cfg.text.max_length, cfg.ar.hidden_dim)
+    assert not any(name.endswith("cross") for name, _ in model.ar.named_modules())
+
+    imgs = model.generate(captions[:2], cfg_scale=2.0)
+    assert imgs.shape == (2, 1, 32, 32)
+    print("caption conditioning OK")
 
 
 def test_criterion_assembly_and_gate():
@@ -74,13 +173,13 @@ def test_criterion_assembly_and_gate():
     cfg.loss.disc_start = 5
     cfg.vfm.enabled = False
 
-    model = EOSTok(cfg)
+    model = ImageGen(cfg)
     adversary = Adversary(cfg)
-    criterion = EOSTokCriterion(cfg, adversary)
+    criterion = ImageGenCriterion(cfg, adversary)
 
     x = torch.randn(4, 1, 32, 32)
-    y = torch.randint(0, 10, (4,))
-    out = model(x, y, keep_tokens=5)
+    captions = ["small dog", "large dog", "dog outside", "dog portrait"]
+    out = model(x, captions, keep_tokens=5)
 
     # Gate closed before disc_start -> the GAN term is exactly zero.
     assert not adversary.active(0)
@@ -112,16 +211,99 @@ def test_criterion_assembly_and_gate():
 
 def test_reconstruct():
     cfg = tiny_config()
-    model = EOSTok(cfg).eval()
+    model = ImageGen(cfg).eval()
     x = torch.randn(2, 1, 32, 32)
     rec = model.reconstruct(x)
     assert rec.shape == x.shape
     print("reconstruction OK")
 
 
+def test_imagewoof_config_defaults():
+    cfg = load_config("configs/imagewoof_64.yaml")
+    assert cfg.text.model_name == "Qwen/Qwen3.5-0.8B"
+    assert cfg.text.freeze is True
+    assert cfg.text.save_encoder_state is False
+    assert cfg.text.cache_dataset is True
+    assert cfg.text.cache_dir == "data/text_cache"
+    assert cfg.text.cache_dtype == "float16"
+    assert cfg.vfm.enabled is False
+    assert cfg.loss.gan == 0.0
+    assert cfg.loss.lpips_enabled is False
+    print("imagewoof config defaults OK")
+
+
+def test_checkpoint_filters_frozen_text_encoder():
+    cfg = tiny_config()
+    cfg.text.save_encoder_state = False
+    model = ImageGen(cfg)
+
+    state = checkpoint_state_dict(model, cfg)
+    assert state
+    assert not any(key.startswith("ar.text.encoder.") for key in state)
+
+    restored = ImageGen(cfg)
+    load_checkpoint_state(restored, state, cfg)
+    print("checkpoint frozen text filtering OK")
+
+
+def test_cached_text_without_live_encoder():
+    cfg = tiny_config()
+    model = ImageGen(cfg)
+    captions = ["small dog", "large dog"]
+    encoded = model.ar.text.encode(captions, torch.device("cpu"))
+    state = checkpoint_state_dict(model, cfg)
+
+    cached = ImageGen(cfg, load_text_encoder=False, text_encoder_dim=cfg.ar.hidden_dim)
+    load_checkpoint_state(cached, state, cfg)
+    assert cached.ar.text.encoder is None
+
+    x = torch.randn(2, 1, 32, 32)
+    drop = torch.tensor([False, True])
+    out = cached(x, encoded, keep_tokens=5, condition_drop=drop)
+    assert out.pixels.recon.shape == (2, 1, 32, 32)
+
+    imgs = cached.generate(encoded, cfg_scale=2.0)
+    assert imgs.shape == (2, 1, 32, 32)
+
+    try:
+        cached.generate(captions)
+    except RuntimeError as exc:
+        assert "Live text encoder is not loaded" in str(exc)
+    else:
+        raise AssertionError("live strings should require a loaded text encoder")
+
+    ema_shadow = ImageGen(cfg, load_text_encoder=False, text_encoder_dim=cfg.ar.hidden_dim)
+    load_checkpoint_state(ema_shadow, state, cfg)
+    ema = EMA(model, shadow=ema_shadow)
+    ema.update(model)
+    assert ema.shadow.ar.text.encoder is None
+    print("cached text without live encoder OK")
+
+
+def test_trainable_text_encoder_must_be_saved():
+    cfg = tiny_config()
+    cfg.text.freeze = False
+    cfg.text.save_encoder_state = False
+    model = ImageGen(cfg)
+    try:
+        checkpoint_state_dict(model, cfg)
+    except ValueError as exc:
+        assert "save_encoder_state" in str(exc)
+    else:
+        raise AssertionError("trainable text encoder should not be silently dropped")
+    print("trainable text encoder checkpoint guard OK")
+
+
 if __name__ == "__main__":
     test_forward_shapes_and_grads()
     test_criterion_assembly_and_gate()
     test_generation()
+    test_cached_generation_logits_match_full_prefix()
+    test_generation_prefills_text_then_steps_visual_cache()
+    test_caption_conditioning()
     test_reconstruct()
+    test_imagewoof_config_defaults()
+    test_checkpoint_filters_frozen_text_encoder()
+    test_cached_text_without_live_encoder()
+    test_trainable_text_encoder_must_be_saved()
     print("all smoke tests passed")

@@ -1,6 +1,6 @@
-"""EOSTok = 1D tokenizer (encoder + IBQ + decoder) + AR model, trained jointly.
+"""ImageGen full model: 1D tokenizer + IBQ + prefix AR, trained jointly.
 
-This module wires the full forward pass of Fig. 2:
+This module wires the EOSTok-style end-to-end image-token training loop:
   x -> encoder -> z -> IBQ -> (z_q, Ind, indices)
   Ind^T Embed -> AR model (teacher forcing) -> logits -> L_NTP
   softmax-STE(logits) -> codebook -> z_hat_q          (APR path)
@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import Config
+from ..text import EncodedText
 from .ar import ARModel
 from .quantizer import IBQQuantizer
 from .tokenizer import Decoder1D, Encoder1D
@@ -51,7 +52,7 @@ class Metrics:
 
 
 @dataclass
-class EOSTokOutput:
+class ImageGenOutput:
     """One forward pass, grouped by role so the criterion and the logger each
     read one group instead of categorising a flat dict by hand."""
     pixels: Pixels
@@ -60,8 +61,13 @@ class EOSTokOutput:
     metrics: Metrics
 
 
-class EOSTok(nn.Module):
-    def __init__(self, cfg: Config):
+class ImageGen(nn.Module):
+    def __init__(
+        self,
+        cfg: Config,
+        load_text_encoder: bool = True,
+        text_encoder_dim: int | None = None,
+    ):
         super().__init__()
         d, t, q, a = cfg.data, cfg.tokenizer, cfg.quantizer, cfg.ar
         self.num_latent_tokens = t.num_latent_tokens
@@ -77,12 +83,20 @@ class EOSTok(nn.Module):
             align_layer=align_layer,
         )
         self.ar = ARModel(
-            q.codebook_size, d.num_classes, t.num_latent_tokens,
+            q.codebook_size, t.num_latent_tokens,
             a.hidden_dim, a.layers, a.num_heads,
+            text_cfg=cfg.text,
+            load_text_encoder=load_text_encoder,
+            text_encoder_dim=text_encoder_dim,
         )
 
-    def forward(self, x: torch.Tensor, labels: torch.Tensor,
-                keep_tokens: int | None = None) -> EOSTokOutput:
+    def forward(
+        self,
+        x: torch.Tensor,
+        condition: str | list[str] | tuple[str, ...] | EncodedText,
+        keep_tokens: int | None = None,
+        condition_drop: torch.Tensor | None = None,
+    ) -> ImageGenOutput:
         """Joint training forward. keep_tokens k (nested dropout) truncates the
         latent sequence fed to the decoder; NTP always uses the full sequence."""
         z, h_enc = self.encoder(x)
@@ -90,7 +104,7 @@ class EOSTok(nn.Module):
         z_q, ind, indices = quant["z_q"], quant["ind"], quant["indices"]
 
         # --- NTP: AR model on soft embeddings, gradients reach encoder+codebook
-        logits = self.ar(self.ar.embed_soft(ind), labels)
+        logits = self.ar(self.ar.embed_soft(ind), condition, condition_drop)
         ntp_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]), indices.reshape(-1)
         )
@@ -108,7 +122,7 @@ class EOSTok(nn.Module):
         dec_out, h_dec = self.decoder(dec_in)
         x_recon, x_apr = dec_out.chunk(2, dim=0)
 
-        return EOSTokOutput(
+        return ImageGenOutput(
             pixels=Pixels(recon=x_recon, apr=x_apr),
             activations=Activations(h_enc=h_enc, h_dec=h_dec),
             reg_losses=RegLosses(
@@ -126,8 +140,12 @@ class EOSTok(nn.Module):
         return self.decoder(z_q)[0]
 
     @torch.no_grad()
-    def generate(self, labels: torch.Tensor, temperature: float = 1.0,
-                 cfg_scale: float = 1.0) -> torch.Tensor:
-        indices = self.ar.generate(labels, temperature, cfg_scale)
+    def generate(
+        self,
+        condition: str | list[str] | tuple[str, ...] | EncodedText,
+        temperature: float = 1.0,
+        cfg_scale: float = 1.0,
+    ) -> torch.Tensor:
+        indices = self.ar.generate(condition, temperature, cfg_scale)
         z_q = self.quantizer.codes_to_latents(indices)
         return self.decoder(z_q)[0]

@@ -1,14 +1,13 @@
 cff-version: 1.2.0
 message: >-
-  This repository is an unofficial reimplementation. If you use it, please
-  cite both this repository and the original paper (see `references`).
-title: "EOSTok-pytorch: Unofficial PyTorch implementation of EOSTok"
+  If you use this software, cite this repository and the related research
+  references listed below as appropriate.
+title: "ImageGen"
 authors:
   - family-names: Deshmukh
     given-names: Tanmay
 type: software
 license: MIT
-repository-code: "https://github.com/tachytelicdetonation/EOSTok-pytorch"
 references:
   - type: article
     title: >-
@@ -30,4 +29,29 @@ references:
         given-names: Qiushan
     year: 2026
     url: "https://arxiv.org/abs/2605.00503"
-    notes: "arXiv:2605.00503"
+    notes: "EOSTok; arXiv:2605.00503"
+  - type: article
+    title: "OmniGen-AR"
+    year: 2026
+    url: "https://arxiv.org/abs/2606.09156"
+    notes: "arXiv:2606.09156"
+  - type: article
+    title: "ARM"
+    year: 2026
+    url: "https://arxiv.org/abs/2606.11188"
+    notes: "arXiv:2606.11188"
+  - type: article
+    title: "UniAR"
+    year: 2026
+    url: "https://arxiv.org/abs/2606.18249"
+    notes: "arXiv:2606.18249"
+  - type: article
+    title: "LINA"
+    year: 2026
+    url: "https://arxiv.org/abs/2601.22630"
+    notes: "arXiv:2601.22630"
+  - type: article
+    title: "ViQ"
+    year: 2026
+    url: "https://arxiv.org/abs/2606.27313"
+    notes: "arXiv:2606.27313"
