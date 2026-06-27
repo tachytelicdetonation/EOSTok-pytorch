@@ -153,14 +153,15 @@ def build_caption_cache(cfg: Config, train: bool, device: torch.device, path: st
         "caption_sha": _caption_fingerprint(captions),
         "encoder_commit": encoder_commit,
     }
+    out_path = Path(path)
     cache = CaptionFeatureCache(
         hidden=torch.cat(hidden_parts, dim=0),
         mask=torch.cat(mask_parts, dim=0),
         captions=captions,
         metadata=metadata,
-        path=Path(path),
+        path=out_path,
     )
-    cache.path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "metadata": cache.metadata,
@@ -168,7 +169,7 @@ def build_caption_cache(cfg: Config, train: bool, device: torch.device, path: st
             "hidden": cache.hidden,
             "mask": cache.mask,
         },
-        cache.path,
+        out_path,
     )
     return cache
 

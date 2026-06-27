@@ -3,11 +3,14 @@
 Run:  python tests/test_smoke.py
 """
 
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 
 from imagegen.config import Config, load_config
 from imagegen.models import ImageGen
+from imagegen.models.ar import ARBlock
 from imagegen.objectives import Adversary, ImageGenCriterion
 from imagegen.training.checkpoint import checkpoint_state_dict, load_checkpoint_state
 from imagegen.training.ema import EMA
@@ -44,15 +47,21 @@ def test_forward_shapes_and_grads():
     assert out.pixels.apr.shape == (4, 1, 32, 32)
     assert out.metrics.indices.shape == (4, 8)
 
-    loss = (out.pixels.recon.pow(2).mean() + out.pixels.apr.pow(2).mean()
-            + out.reg_losses.ntp + out.reg_losses.commit
-            + 0.01 * out.reg_losses.entropy)
+    loss = (
+        out.pixels.recon.pow(2).mean()
+        + out.pixels.apr.pow(2).mean()
+        + out.reg_losses.ntp
+        + out.reg_losses.commit
+        + 0.01 * out.reg_losses.entropy
+    )
     loss.backward()
 
     # End-to-end gradient flow: pixel/NTP losses must reach encoder, codebook, AR.
     assert model.encoder.patchify.weight.grad is not None
     assert model.encoder.patchify.weight.grad.abs().sum() > 0
+    assert model.quantizer.codebook.grad is not None
     assert model.quantizer.codebook.grad.abs().sum() > 0
+    assert model.ar.tok_emb.weight.grad is not None
     assert model.ar.tok_emb.weight.grad.abs().sum() > 0
     print("forward/backward OK")
 
@@ -72,7 +81,7 @@ def test_cached_generation_logits_match_full_prefix():
     cfg = tiny_config()
     model = ImageGen(cfg).eval()
     captions = ["small dog", "large dog"]
-    text = model.ar.text(captions, torch.device("cpu"))
+    text = model.ar.text(model.ar.prepare_condition(captions, torch.device("cpu")))
     fixed_tokens = torch.arange(6).reshape(2, 3) % cfg.quantizer.codebook_size
 
     dtype = model.ar.tok_emb.weight.dtype
@@ -85,15 +94,20 @@ def test_cached_generation_logits_match_full_prefix():
     full_logits = []
     for step in range(fixed_tokens.shape[1]):
         step_x = model.ar._add_pos(step_x, key_mask.shape[1])
-        step_key_mask = torch.cat([
-            key_mask,
-            torch.ones((2, 1), dtype=torch.bool),
-        ], dim=1)
+        step_key_mask = torch.cat(
+            [
+                key_mask,
+                torch.ones((2, 1), dtype=torch.bool),
+            ],
+            dim=1,
+        )
         h_cached, caches = model.ar._run_cached(step_x, step_key_mask, caches)
         cached_logits.append(model.ar.head(model.ar.norm_f(h_cached[:, -1])))
 
         if step == 0:
-            visual_in = model.ar.img_start.to(dtype=dtype).view(1, 1, -1).expand(2, 1, -1)
+            visual_in = (
+                model.ar.img_start.to(dtype=dtype).view(1, 1, -1).expand(2, 1, -1)
+            )
         else:
             prev = model.ar.tok_emb(fixed_tokens[:, :step])
             start = model.ar.img_start.to(dtype=dtype).view(1, 1, -1).expand(2, 1, -1)
@@ -115,7 +129,7 @@ def test_generation_prefills_text_then_steps_visual_cache():
     cfg = tiny_config()
     model = ImageGen(cfg).eval()
     seen = []
-    first_block = model.ar.blocks[0]
+    first_block = cast(ARBlock, model.ar.blocks[0])
     original_forward_cached = first_block.forward_cached
 
     def wrapped_forward_cached(x, key_mask, kv_cache=None):
@@ -125,13 +139,15 @@ def test_generation_prefills_text_then_steps_visual_cache():
     def fail_full_run(*_, **__):
         raise AssertionError("generation should use the cached path")
 
-    first_block.forward_cached = wrapped_forward_cached
+    first_block.forward_cached = wrapped_forward_cached  # pyrefly: ignore[bad-argument-type]  # test monkeypatch
     model.ar._run = fail_full_run
 
     tokens = model.ar.generate(["small dog", "large dog"], cfg_scale=2.0)
 
     expected = [(cfg.text.max_length, cfg.text.max_length, True)]
-    expected.extend((1, cfg.text.max_length + step + 1, False) for step in range(model.ar.seq_len))
+    expected.extend(
+        (1, cfg.text.max_length + step + 1, False) for step in range(model.ar.seq_len)
+    )
     assert seen == expected
     assert tokens.shape == (2, model.ar.seq_len)
     print("generation cache structure OK")
@@ -150,11 +166,18 @@ def test_caption_conditioning():
     # Condition dropout now runs through the conditioner's force_empty mask: a
     # dropped row collapses to the null-token prefix, a kept row keeps its caption.
     drop = torch.tensor([True, False, True, False])
-    dropped_text = model.ar.text(captions, torch.device("cpu"), force_empty=drop)
-    assert dropped_text.mask[2, 0] and not dropped_text.mask[2, 1:].any()  # dropped -> null
-    assert dropped_text.mask[3, 1:].any()                                  # kept -> real caption
+    dropped = model.ar.prepare_condition(
+        captions, torch.device("cpu"), force_empty=drop
+    )
+    dropped_text = model.ar.text(dropped)
+    assert (
+        dropped_text.mask[2, 0] and not dropped_text.mask[2, 1:].any()
+    )  # dropped -> null
+    assert dropped_text.mask[3, 1:].any()  # kept -> real caption
 
-    text = model.ar.text(["", "large dog"], torch.device("cpu"))
+    text = model.ar.text(
+        model.ar.prepare_condition(["", "large dog"], torch.device("cpu"))
+    )
     assert text.mask.shape == (2, cfg.text.max_length)
     assert text.mask[0, 0]
     assert not text.mask[0, 1:].any()
@@ -177,7 +200,7 @@ def test_criterion_assembly_and_gate():
 
     model = ImageGen(cfg)
     adversary = Adversary(cfg)
-    criterion = ImageGenCriterion(cfg, adversary)
+    criterion = ImageGenCriterion(cfg)
 
     x = torch.randn(4, 1, 32, 32)
     captions = ["small dog", "large dog", "dog outside", "dog portrait"]
@@ -185,7 +208,7 @@ def test_criterion_assembly_and_gate():
 
     # Gate closed before disc_start -> the GAN term is exactly zero.
     assert not adversary.active(0)
-    loss0, m0 = criterion(out, x, 0)
+    loss0, m0 = criterion(out, x, 0, adversary.g_term(out.pixels.recon, 0))
     assert m0["g"].item() == 0.0
 
     # Hand-assemble Eq. 8 (LPIPS off, VFM off) and compare term-for-term.
@@ -201,11 +224,11 @@ def test_criterion_assembly_and_gate():
 
     # Gate open at disc_start -> the GAN term switches on.
     assert adversary.active(5)
-    _, m1 = criterion(out, x, 5)
+    _, m1 = criterion(out, x, 5, adversary.g_term(out.pixels.recon, 5))
     assert m1["g"].item() != 0.0
 
-    # The borrowed discriminator is NOT a param of the criterion (it belongs to
-    # the adversary's optimizer).
+    # The discriminator is NOT a param of the criterion (it belongs to the
+    # adversary's optimizer).
     crit_params = {id(p) for p in criterion.parameters()}
     assert not any(id(p) in crit_params for p in adversary.parameters())
     print("criterion assembly + disc_start gate OK")
@@ -274,11 +297,13 @@ def test_cached_text_without_live_encoder():
     else:
         raise AssertionError("live strings should require a loaded text encoder")
 
-    ema_shadow = ImageGen(cfg, load_text_encoder=False, text_encoder_dim=cfg.ar.hidden_dim)
+    ema_shadow = ImageGen(
+        cfg, load_text_encoder=False, text_encoder_dim=cfg.ar.hidden_dim
+    )
     load_checkpoint_state(ema_shadow, state, cfg)
     ema = EMA(model, shadow=ema_shadow)
     ema.update(model)
-    assert ema.shadow.ar.text.encoder is None
+    assert cast(ImageGen, ema.shadow).ar.text.encoder is None
     print("cached text without live encoder OK")
 
 
@@ -288,9 +313,15 @@ def test_caption_fingerprint_detects_reorder():
     from imagegen.text.cache import _caption_fingerprint
 
     captions = ["small dog", "large dog", "a cat"]
-    assert _caption_fingerprint(captions) == _caption_fingerprint(list(captions))  # stable
-    assert _caption_fingerprint(captions) != _caption_fingerprint(captions[::-1])  # order
-    assert _caption_fingerprint(captions) != _caption_fingerprint(captions[:2])    # content
+    assert _caption_fingerprint(captions) == _caption_fingerprint(
+        list(captions)
+    )  # stable
+    assert _caption_fingerprint(captions) != _caption_fingerprint(
+        captions[::-1]
+    )  # order
+    assert _caption_fingerprint(captions) != _caption_fingerprint(
+        captions[:2]
+    )  # content
     print("caption fingerprint reorder/content detection OK")
 
 
@@ -307,8 +338,9 @@ def test_load_ema_model_recon_skips_text_encoder():
     with tempfile.TemporaryDirectory() as tmp:
         ckpt_path = Path(tmp) / "ema.ckpt"
         torch.save({"ema": checkpoint_state_dict(model, cfg)}, ckpt_path)
-        recon_model = load_ema_model(cfg, str(ckpt_path), torch.device("cpu"),
-                                     load_text_encoder=False)
+        recon_model = load_ema_model(
+            cfg, str(ckpt_path), torch.device("cpu"), load_text_encoder=False
+        )
     assert recon_model.ar.text.encoder is None
     rec = recon_model.reconstruct(torch.randn(2, 1, 32, 32))
     assert rec.shape == (2, 1, 32, 32)

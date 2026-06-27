@@ -9,6 +9,7 @@ consumes through causal self-attention.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -28,7 +29,8 @@ class EncodedText:
 
     Canonical shape is always batched: hidden (B, L, D), mask (B, L). A 2D input
     (a single row, e.g. from a cache __getitem__) is unsqueezed once at
-    construction, so every method can assume 3D instead of probing the rank."""
+    construction, so every method can assume 3D instead of probing the rank.
+    """
 
     hidden: torch.Tensor
     mask: torch.Tensor
@@ -37,6 +39,7 @@ class EncodedText:
         if self.hidden.ndim == 2:
             self.hidden = self.hidden.unsqueeze(0)
             self.mask = self.mask.unsqueeze(0)
+        self.mask = self.mask.to(dtype=torch.bool)
 
     def __len__(self) -> int:
         return int(self.hidden.shape[0])
@@ -58,8 +61,119 @@ class EncodedText:
         return EncodedText(hidden, mask)
 
 
+def _empty_mask(
+    force_empty: torch.Tensor | None, batch: int, device: torch.device
+) -> torch.Tensor | None:
+    if force_empty is None:
+        return None
+    mask = force_empty.to(device=device, dtype=torch.bool)
+    if mask.ndim == 0:
+        mask = mask.unsqueeze(0)
+    if mask.shape != (batch,):
+        raise ValueError(
+            f"force_empty shape {tuple(mask.shape)} does not match batch {(batch,)}"
+        )
+    return mask
+
+
+@dataclass
+class PreparedCondition:
+    """Canonical condition batch consumed by the AR model.
+
+    Public callers may still pass raw captions or cached ``EncodedText`` at the
+    package boundary, but the model itself operates on this prepared form:
+    encoder hidden states plus the optional rows that should be collapsed to the
+    learned null token. CFG, condition dropout, cached captions, and live caption
+    strings all converge here instead of each layer branching on their origin.
+    """
+
+    encoded: EncodedText
+    force_empty: torch.Tensor | None = None
+
+    def __post_init__(self):
+        self.force_empty = _empty_mask(
+            self.force_empty,
+            len(self.encoded),
+            self.encoded.hidden.device,
+        )
+
+    def __len__(self) -> int:
+        return len(self.encoded)
+
+    def to(self, device: torch.device) -> "PreparedCondition":
+        return PreparedCondition(
+            self.encoded.to(device),
+            None
+            if self.force_empty is None
+            else self.force_empty.to(device=device, dtype=torch.bool),
+        )
+
+    def take(self, index) -> "PreparedCondition":
+        force_empty = None if self.force_empty is None else self.force_empty[index]
+        return PreparedCondition(self.encoded.take(index), force_empty)
+
+    def with_force_empty(
+        self, force_empty: torch.Tensor | None, device: torch.device
+    ) -> "PreparedCondition":
+        prepared = self.to(device)
+        extra = _empty_mask(force_empty, len(prepared), device)
+        if extra is None:
+            return prepared
+        if prepared.force_empty is None:
+            return PreparedCondition(prepared.encoded, extra)
+        return PreparedCondition(prepared.encoded, prepared.force_empty | extra)
+
+    def cfg_batch(
+        self, cfg_scale: float, device: torch.device
+    ) -> tuple["PreparedCondition", bool]:
+        """Return the [conditional; unconditional] CFG batch when enabled."""
+        prepared = self.to(device)
+        if cfg_scale == 1.0:
+            return prepared, False
+
+        n = len(prepared)
+        encoded = prepared.encoded
+        doubled = EncodedText(
+            torch.cat([encoded.hidden, encoded.hidden], dim=0),
+            torch.cat([encoded.mask, encoded.mask], dim=0),
+        )
+        conditional_empty = (
+            prepared.force_empty
+            if prepared.force_empty is not None
+            else torch.zeros(n, dtype=torch.bool, device=device)
+        )
+        force_empty = torch.cat(
+            [
+                conditional_empty,
+                torch.ones(n, dtype=torch.bool, device=device),
+            ]
+        )
+        return PreparedCondition(doubled, force_empty), True
+
+
 Captions = str | list[str] | tuple[str, ...]
-Condition = Captions | EncodedText
+ConditionInput = Captions | EncodedText
+Condition = ConditionInput | PreparedCondition
+
+
+def normalize_condition(condition: ConditionInput) -> ConditionInput:
+    if isinstance(condition, EncodedText):
+        return condition
+    return TextConditioner.normalize_captions(condition)
+
+
+def condition_len(condition: ConditionInput | PreparedCondition) -> int:
+    if isinstance(condition, (EncodedText, PreparedCondition)):
+        return len(condition)
+    return len(TextConditioner.normalize_captions(condition))
+
+
+def condition_take(
+    condition: ConditionInput | PreparedCondition, index
+) -> ConditionInput | PreparedCondition:
+    if isinstance(condition, (EncodedText, PreparedCondition)):
+        return condition.take(index)
+    return TextConditioner.normalize_captions(condition)[index]
 
 
 @dataclass
@@ -77,7 +191,9 @@ class _TinyTextBackbone(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     @staticmethod
-    def encode(captions: list[str], max_length: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        captions: list[str], max_length: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         ids = torch.zeros(len(captions), max_length, dtype=torch.long, device=device)
         mask = torch.zeros(len(captions), max_length, dtype=torch.bool, device=device)
         for row, caption in enumerate(captions):
@@ -115,15 +231,25 @@ class TextConditioner(nn.Module):
             self.encoder = _TinyTextBackbone(encoder_dim) if load_encoder else None
         else:
             if load_encoder:
-                from transformers import AutoModel, AutoTokenizer
-
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    cfg.model_name,
-                    revision=cfg.revision,
-                    trust_remote_code=cfg.trust_remote_code,
+                from transformers import (
+                    AutoModel,
+                    AutoTokenizer,
+                    PreTrainedTokenizerBase,
                 )
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
+
+                # from_pretrained's union return (backend variants, None) hides
+                # pad_token from the checker; cast to the base it actually is.
+                tokenizer = cast(
+                    PreTrainedTokenizerBase,
+                    AutoTokenizer.from_pretrained(
+                        cfg.model_name,
+                        revision=cfg.revision,
+                        trust_remote_code=cfg.trust_remote_code,
+                    ),
+                )
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                self.tokenizer = tokenizer
                 self.encoder = AutoModel.from_pretrained(
                     cfg.model_name,
                     revision=cfg.revision,
@@ -161,9 +287,13 @@ class TextConditioner(nn.Module):
     def _hidden_size(config) -> int:
         if hasattr(config, "hidden_size"):
             return config.hidden_size
-        if hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
+        if hasattr(config, "text_config") and hasattr(
+            config.text_config, "hidden_size"
+        ):
             return config.text_config.hidden_size
-        raise ValueError("Text encoder config does not expose hidden_size or text_config.hidden_size")
+        raise ValueError(
+            "Text encoder config does not expose hidden_size or text_config.hidden_size"
+        )
 
     @classmethod
     def _resolve_hidden_size(cls, cfg: TextConfig) -> int:
@@ -194,7 +324,9 @@ class TextConditioner(nn.Module):
         if self.use_tiny:
             return _TinyTextBackbone.encode(captions, self.max_length, device)
 
-        batch = self.tokenizer(
+        tokenizer = self.tokenizer
+        assert tokenizer is not None
+        batch = tokenizer(
             captions,
             padding="max_length",
             truncation=True,
@@ -205,55 +337,82 @@ class TextConditioner(nn.Module):
         mask = batch["attention_mask"].to(device=device, dtype=torch.bool)
         return input_ids, mask
 
-    def _encode_hidden(self, input_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _encode_hidden(
+        self, input_ids: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
         kwargs = {
             "input_ids": input_ids,
             "attention_mask": mask.to(dtype=torch.long),
             "output_hidden_states": True,
             "return_dict": True,
         }
+        encoder = self.encoder
+        assert encoder is not None
         # Whether the encoder accepts use_cache is a fixed property of the model;
         # probe it once via try/except, then branch on the memoized result.
-        if self._encoder_use_cache is True:
-            output = self.encoder(**kwargs, use_cache=False)
-        elif self._encoder_use_cache is False:
-            output = self.encoder(**kwargs)
+        if self._encoder_use_cache:
+            output = encoder(**kwargs, use_cache=False)
+        elif self._encoder_use_cache is not None:
+            output = encoder(**kwargs)
         else:
             try:
-                output = self.encoder(**kwargs, use_cache=False)
+                output = encoder(**kwargs, use_cache=False)
                 self._encoder_use_cache = True
             except TypeError:
-                output = self.encoder(**kwargs)
+                output = encoder(**kwargs)
                 self._encoder_use_cache = False
 
-        if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        if (
+            hasattr(output, "last_hidden_state")
+            and output.last_hidden_state is not None
+        ):
             return output.last_hidden_state
         if hasattr(output, "hidden_states") and output.hidden_states:
             return output.hidden_states[-1]
         raise RuntimeError("Text encoder output does not include hidden states")
 
+    def _encode_captions(self, captions: Captions, device: torch.device) -> EncodedText:
+        captions = self.normalize_captions(captions)
+        input_ids, mask = self._tokenize(captions, device)
+        if self.cfg.freeze:
+            with torch.no_grad():
+                hidden = self._encode_hidden(input_ids, mask)
+        else:
+            hidden = self._encode_hidden(input_ids, mask)
+        return EncodedText(hidden, mask)
+
     @torch.no_grad()
     def encode(self, captions: Captions, device: torch.device) -> EncodedText:
         """Run only the frozen text encoder and return raw hidden states."""
-        captions = self.normalize_captions(captions)
-        input_ids, mask = self._tokenize(captions, device)
-        hidden = self._encode_hidden(input_ids, mask)
-        return EncodedText(hidden.detach().cpu(), mask.detach().cpu())
+        encoded = self._encode_captions(captions, device)
+        return EncodedText(encoded.hidden.detach().cpu(), encoded.mask.detach().cpu())
 
-    def _project_encoded(
+    def prepare(
         self,
-        encoded: EncodedText,
+        condition: Condition,
         device: torch.device,
         force_empty: torch.Tensor | None = None,
-    ) -> TextCondition:
-        encoded = encoded.to(device)
-        hidden = encoded.hidden.to(self.token_proj.weight.dtype)
-        mask = encoded.mask
+    ) -> PreparedCondition:
+        """Normalize public condition inputs to the model's canonical boundary."""
+        if isinstance(condition, PreparedCondition):
+            return condition.with_force_empty(force_empty, device)
+        if isinstance(condition, EncodedText):
+            encoded = condition.to(device)
+        else:
+            encoded = self._encode_captions(condition, device)
+        return PreparedCondition(
+            encoded, _empty_mask(force_empty, len(encoded), device)
+        )
+
+    def _project_prepared(self, prepared: PreparedCondition) -> TextCondition:
+        prepared = prepared.to(self.token_proj.weight.device)
+        hidden = prepared.encoded.hidden.to(self.token_proj.weight.dtype)
+        mask = prepared.encoded.mask
         text_tokens = self.token_proj(hidden)
 
         empty = ~mask.any(dim=1)
-        if force_empty is not None:
-            empty = empty | force_empty.to(device=device, dtype=torch.bool)
+        if prepared.force_empty is not None:
+            empty = empty | prepared.force_empty
         if empty.any():
             mask = mask.clone()
             text_tokens = text_tokens.clone()
@@ -264,33 +423,5 @@ class TextConditioner(nn.Module):
 
         return TextCondition(tokens=text_tokens, mask=mask)
 
-    def forward(
-        self,
-        captions: Condition,
-        device: torch.device,
-        force_empty: torch.Tensor | None = None,
-    ) -> TextCondition:
-        if isinstance(captions, EncodedText):
-            return self._project_encoded(captions, device, force_empty)
-
-        captions = self.normalize_captions(captions)
-        null_caption = torch.tensor(
-            [caption.strip() == "" for caption in captions],
-            dtype=torch.bool,
-            device=device,
-        )
-        if force_empty is not None:
-            null_caption = null_caption | force_empty.to(device=device, dtype=torch.bool)
-        input_ids, mask = self._tokenize(captions, device)
-
-        if self.cfg.freeze:
-            with torch.no_grad():
-                hidden = self._encode_hidden(input_ids, mask)
-        else:
-            hidden = self._encode_hidden(input_ids, mask)
-
-        # Projection + null-token injection live only in _project_encoded. The
-        # empty rows are (empty caption OR force_empty), folded into null_caption
-        # and passed through as force_empty (hidden stays uncast — the projection
-        # path casts once). This is the same null-out the cached path runs.
-        return self._project_encoded(EncodedText(hidden, mask), device, force_empty=null_caption)
+    def forward(self, condition: PreparedCondition) -> TextCondition:
+        return self._project_prepared(condition)

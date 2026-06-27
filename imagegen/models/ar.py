@@ -12,12 +12,14 @@ stream and consumed by the same causal self-attention stack as image tokens.
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import TextConfig
-from ..text import Condition, EncodedText, TextCondition, TextConditioner
+from ..text import Condition, PreparedCondition, TextCondition, TextConditioner
 
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -111,7 +113,9 @@ class ARBlock(nn.Module):
         key_mask: torch.Tensor,
         kv_cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, KVCache]:
-        attn_out, next_cache = self.attn.forward_cached(self.norm1(x), key_mask, kv_cache)
+        attn_out, next_cache = self.attn.forward_cached(
+            self.norm1(x), key_mask, kv_cache
+        )
         x = x + attn_out
         x = x + self.mlp(self.norm2(x))
         return x, next_cache
@@ -151,32 +155,13 @@ class ARModel(nn.Module):
         self.norm_f = nn.RMSNorm(dim)
         self.head = nn.Linear(dim, codebook_size, bias=False)
 
-    def _cfg_double(self, condition: Condition, cfg_scale: float):
-        """Build the classifier-free-guidance batch: duplicate the condition into
-        [conditional; unconditional] halves and return a force_empty mask marking
-        the unconditional half (which the conditioner collapses to the learned
-        null token). cfg off -> (condition, None).
-
-        This is the single mechanism for "make this row unconditional", shared by
-        cached EncodedText and live captions, replacing the old caption-rewrite
-        path and the separate cached force_empty path with one route."""
-        if cfg_scale == 1.0:
-            return condition, None
-        if isinstance(condition, EncodedText):
-            n = condition.hidden.shape[0]
-            doubled = EncodedText(
-                torch.cat([condition.hidden, condition.hidden], dim=0),
-                torch.cat([condition.mask, condition.mask], dim=0),
-            )
-        else:
-            captions = TextConditioner.normalize_captions(condition)
-            n = len(captions)
-            doubled = captions + captions
-        force_empty = torch.cat([
-            torch.zeros(n, dtype=torch.bool, device=self.pos_emb.device),
-            torch.ones(n, dtype=torch.bool, device=self.pos_emb.device),
-        ])
-        return doubled, force_empty
+    def prepare_condition(
+        self,
+        condition: Condition,
+        device: torch.device,
+        force_empty: torch.Tensor | None = None,
+    ) -> PreparedCondition:
+        return self.text.prepare(condition, device, force_empty)
 
     def embed_soft(self, ind: torch.Tensor) -> torch.Tensor:
         """Soft token embedding h = Ind^T Embed (differentiable into the tokenizer)."""
@@ -239,12 +224,15 @@ class ARModel(nn.Module):
             cache_iter: list[KVCache | None] = [None] * len(self.blocks)
         else:
             if len(caches) != len(self.blocks):
-                raise ValueError(f"Expected {len(self.blocks)} caches, got {len(caches)}")
+                raise ValueError(
+                    f"Expected {len(self.blocks)} caches, got {len(caches)}"
+                )
             cache_iter = list(caches)
 
         next_caches = []
         for blk, cache in zip(self.blocks, cache_iter):
-            x, next_cache = blk.forward_cached(x, key_mask, cache)
+            # ModuleList erases the element type to Module; cast back to ARBlock.
+            x, next_cache = cast(ARBlock, blk).forward_cached(x, key_mask, cache)
             next_caches.append(next_cache)
         return x, next_caches
 
@@ -261,7 +249,8 @@ class ARModel(nn.Module):
         ``<img>, code_1, ..., code_{L-1}``, while the caption is a prefix.
         """
         B, L, _ = tok_embs.shape
-        text = self._match_text_batch(self.text(condition, tok_embs.device, condition_drop), B)
+        prepared = self.prepare_condition(condition, tok_embs.device, condition_drop)
+        text = self._match_text_batch(self.text(prepared), B)
         visual_in = self._visual_input(tok_embs)
         x, key_mask, text_len = self._prefix_sequence(text, visual_in)
         h = self._run(x, key_mask)
@@ -277,14 +266,13 @@ class ARModel(nn.Module):
         """Sample (B, L) code indices.
 
         CFG uses the same prefix-AR path with a null-token prefix as the
-        unconditional branch: l_g = l_u + s * (l_c - l_u). `_cfg_double` builds
-        the [conditional; unconditional] batch through one force_empty mechanism
-        for both cached EncodedText and live captions.
+        unconditional branch: l_g = l_u + s * (l_c - l_u). Conditions are first
+        normalized to PreparedCondition, then CFG duplicates that canonical batch.
         """
         device = self.pos_emb.device
-        use_cfg = cfg_scale != 1.0
-        doubled, force_empty = self._cfg_double(condition, cfg_scale)
-        text = self.text(doubled, device, force_empty)
+        prepared = self.prepare_condition(condition, device)
+        prepared, use_cfg = prepared.cfg_batch(cfg_scale, device)
+        text = self.text(prepared)
 
         batch = text.tokens.shape[0]
         tokens = []

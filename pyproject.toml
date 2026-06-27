@@ -24,3 +24,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["imagegen*"]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.1.1",
+]

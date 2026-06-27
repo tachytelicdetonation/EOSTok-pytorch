@@ -67,7 +67,7 @@ def main():
     args = ap.parse_args()
 
     try:
-        from cleanfid import fid
+        from cleanfid import fid  # pyrefly: ignore[missing-import]  # optional 'eval' extra
     except ImportError:
         raise SystemExit("clean-fid not installed: pip install clean-fid")
 

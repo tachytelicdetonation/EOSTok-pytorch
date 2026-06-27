@@ -12,6 +12,8 @@ The VFM (default DINOv2) is frozen; only the projectors train.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,6 +37,10 @@ class MlpProjector(nn.Module):
 
 
 class VFMAligner(nn.Module):
+    # ponytail: the hub DINOv2 has no stubs; Any is its honest type so its
+    # dynamic attrs (patch_size, embed_dim, forward_features) type-check.
+    vfm: Any
+
     def __init__(
         self,
         model_name: str,
@@ -44,7 +50,9 @@ class VFMAligner(nn.Module):
     ):
         super().__init__()
         self.tokenizer_grid = tokenizer_grid
-        self.vfm = torch.hub.load("facebookresearch/dinov2", model_name)
+        # cast: hub.load is typed -> object, which would narrow self.vfm here and
+        # mask its dynamic DINOv2 attributes; Any is the honest boundary type.
+        self.vfm = cast(Any, torch.hub.load("facebookresearch/dinov2", model_name))
         self.vfm.eval()
         for p in self.vfm.parameters():
             p.requires_grad_(False)

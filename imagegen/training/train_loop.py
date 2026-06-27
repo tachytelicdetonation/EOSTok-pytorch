@@ -17,6 +17,7 @@ import math
 import random
 import time
 from pathlib import Path
+from typing import cast
 
 import torch
 from torchvision.utils import save_image
@@ -25,7 +26,12 @@ from ..config import Config, load_config
 from ..data import build_loader
 from ..models import ImageGen
 from ..objectives import Adversary, ImageGenCriterion
-from ..text import EncodedText, ensure_caption_cache
+from ..text import (
+    condition_len,
+    condition_take,
+    ensure_caption_cache,
+    normalize_condition,
+)
 from .checkpoint import checkpoint_state_dict, load_checkpoint_state
 from .ema import EMA
 
@@ -64,24 +70,33 @@ def sample_keep_tokens(L: int, p: float) -> int:
 def prepare_text_caches(cfg: Config, args, device: torch.device):
     """Build (or load) the frozen text-encoder caption caches when requested.
     Returns (train_cache, val_cache, encoder_dim); all None when caching is off."""
-    cache_requested = (
-        args.text_cache == "on"
-        or (args.text_cache == "auto" and cfg.text.freeze and cfg.text.cache_dataset)
+    cache_requested = args.text_cache == "on" or (
+        args.text_cache == "auto" and cfg.text.freeze and cfg.text.cache_dataset
     )
     if cache_requested and not cfg.text.freeze:
-        raise ValueError("Text cache requires cfg.text.freeze=true; trainable encoders must stay live.")
+        raise ValueError(
+            "Text cache requires cfg.text.freeze=true; trainable encoders must stay live."
+        )
     if not cache_requested:
         return None, None, None
 
     print("[imagegen] preparing frozen text-encoder caption caches")
-    train_cache = ensure_caption_cache(cfg, train=True, device=device, rebuild=args.rebuild_text_cache)
-    val_cache = ensure_caption_cache(cfg, train=False, device=device, rebuild=args.rebuild_text_cache)
+    train_cache = ensure_caption_cache(
+        cfg, train=True, device=device, rebuild=args.rebuild_text_cache
+    )
+    val_cache = ensure_caption_cache(
+        cfg, train=False, device=device, rebuild=args.rebuild_text_cache
+    )
     if train_cache.encoder_dim != val_cache.encoder_dim:
-        raise ValueError("Train/validation text caches have different encoder dimensions.")
+        raise ValueError(
+            "Train/validation text caches have different encoder dimensions."
+        )
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(f"[imagegen] text cache ready: train={len(train_cache)} "
-          f"val={len(val_cache)} dim={train_cache.encoder_dim}")
+    print(
+        f"[imagegen] text cache ready: train={len(train_cache)} "
+        f"val={len(val_cache)} dim={train_cache.encoder_dim}"
+    )
     return train_cache, val_cache, train_cache.encoder_dim
 
 
@@ -90,30 +105,47 @@ def build_optimizers(model, criterion, adversary, tc):
     tokenizer vs AR groups (Table 9); the criterion's trainable params (VFM
     projectors; PerceptualLoss is frozen) ride in the tokenizer group. The
     discriminator is the only thing the adversary owns params for."""
-    tok_params = (list(model.encoder.parameters())
-                  + list(model.decoder.parameters())
-                  + list(model.quantizer.parameters())
-                  + [p for p in criterion.parameters() if p.requires_grad])
+    tok_params = (
+        list(model.encoder.parameters())
+        + list(model.decoder.parameters())
+        + list(model.quantizer.parameters())
+        + [p for p in criterion.parameters() if p.requires_grad]
+    )
     ar_params = [p for p in model.ar.parameters() if p.requires_grad]
-    opt_g = torch.optim.Adam([
-        {"params": tok_params, "betas": (tc.beta1, tc.beta2_tokenizer)},
-        {"params": ar_params, "betas": (tc.beta1, tc.beta2_ar)},
-    ], lr=tc.lr)
-    opt_d = torch.optim.Adam(adversary.parameters(), lr=tc.disc_lr,
-                             betas=(tc.beta1, tc.beta2_tokenizer))
+    opt_g = torch.optim.Adam(
+        [
+            {"params": tok_params, "betas": (tc.beta1, tc.beta2_tokenizer)},
+            {"params": ar_params, "betas": (tc.beta1, tc.beta2_ar)},
+        ],
+        lr=tc.lr,
+    )
+    opt_d = torch.optim.Adam(
+        adversary.parameters(), lr=tc.disc_lr, betas=(tc.beta1, tc.beta2_tokenizer)
+    )
     return opt_g, opt_d
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--max-steps", type=int, default=None,
-                    help="Stop early (overrides epochs); useful for smoke tests")
+    ap.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Stop early (overrides epochs); useful for smoke tests",
+    )
     ap.add_argument("--resume", type=str, default=None)
-    ap.add_argument("--text-cache", choices=["auto", "on", "off"], default="auto",
-                    help="Precompute frozen text-encoder caption features for dataset splits")
-    ap.add_argument("--rebuild-text-cache", action="store_true",
-                    help="Rebuild cached caption features even if a matching cache exists")
+    ap.add_argument(
+        "--text-cache",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Precompute frozen text-encoder caption features for dataset splits",
+    )
+    ap.add_argument(
+        "--rebuild-text-cache",
+        action="store_true",
+        help="Rebuild cached caption features even if a matching cache exists",
+    )
     args = ap.parse_args()
 
     cfg: Config = load_config(args.config)
@@ -126,7 +158,9 @@ def main():
     (out_dir / "samples").mkdir(parents=True, exist_ok=True)
     print(f"[imagegen] device={device} amp={dtype} out={out_dir}")
 
-    train_text_cache, val_text_cache, text_encoder_dim = prepare_text_caches(cfg, args, device)
+    train_text_cache, val_text_cache, text_encoder_dim = prepare_text_caches(
+        cfg, args, device
+    )
 
     loader = build_loader(cfg.data, train=True, text_cache=train_text_cache)
     steps_per_epoch = len(loader)
@@ -139,12 +173,14 @@ def main():
     ).to(device)
     # The objective, as two sibling modules (opposed optimizers).
     adversary = Adversary(cfg).to(device)
-    criterion = ImageGenCriterion(cfg, adversary).to(device)
+    criterion = ImageGenCriterion(cfg).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[imagegen] model params: {n_params / 1e6:.1f}M "
-          f"(tokenizer {sum(p.numel() for m in (model.encoder, model.decoder, model.quantizer) for p in m.parameters()) / 1e6:.1f}M, "
-          f"AR {sum(p.numel() for p in model.ar.parameters()) / 1e6:.1f}M)")
+    print(
+        f"[imagegen] model params: {n_params / 1e6:.1f}M "
+        f"(tokenizer {sum(p.numel() for m in (model.encoder, model.decoder, model.quantizer) for p in m.parameters()) / 1e6:.1f}M, "
+        f"AR {sum(p.numel() for p in model.ar.parameters()) / 1e6:.1f}M)"
+    )
 
     tc = cfg.train
     opt_g, opt_d = build_optimizers(model, criterion, adversary, tc)
@@ -161,9 +197,13 @@ def main():
 
     def checkpoint() -> dict:
         return {
-            "model": checkpoint_state_dict(model, cfg), "adversary": adversary.state_dict(),
-            "criterion": criterion.state_dict(), "ema": checkpoint_state_dict(ema.shadow, cfg),
-            "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(), "step": step,
+            "model": checkpoint_state_dict(model, cfg),
+            "adversary": adversary.state_dict(),
+            "criterion": criterion.state_dict(),
+            "ema": checkpoint_state_dict(ema.shadow, cfg),
+            "opt_g": opt_g.state_dict(),
+            "opt_d": opt_d.state_dict(),
+            "step": step,
         }
 
     step = 0
@@ -183,7 +223,9 @@ def main():
     if val_text_cache is not None and len(val_text_cache) > 0:
         g = torch.Generator().manual_seed(cfg.seed)
         count = min(32, len(val_text_cache))
-        fixed_conditions = val_text_cache.take(torch.randperm(len(val_text_cache), generator=g)[:count])
+        fixed_conditions = val_text_cache.take(
+            torch.randperm(len(val_text_cache), generator=g)[:count]
+        )
 
     model.train()
     done = False
@@ -194,16 +236,19 @@ def main():
                 done = True
                 break
             x = x.to(device, non_blocking=True)
-            if not isinstance(condition, EncodedText):
-                condition = list(condition)
+            condition = normalize_condition(condition)
+            batch_conditions = condition_len(condition)
             if fixed_conditions is None:
-                fixed_conditions = (condition.take(slice(0, min(32, len(condition))))
-                                    if isinstance(condition, EncodedText) else condition[:32])
+                fixed_conditions = condition_take(
+                    condition, slice(0, min(32, batch_conditions))
+                )
 
             # Condition dropout for CFG: force_empty marks the dropped rows, which
             # the conditioner collapses to the null token. One mechanism for both
             # cached EncodedText and live captions.
-            condition_drop = torch.rand(len(condition), device=device) < cfg.ar.condition_dropout
+            condition_drop = (
+                torch.rand(batch_conditions, device=device) < cfg.ar.condition_dropout
+            )
 
             lr = cosine_lr(step, total_steps, tc.lr, tc.min_lr)
             for group in opt_g.param_groups:
@@ -211,18 +256,22 @@ def main():
 
             k = sample_keep_tokens(L, tc.nested_dropout)
 
-            ctx = (torch.autocast(device.type, dtype=dtype)
-                   if dtype else contextlib.nullcontext())
+            ctx = (
+                torch.autocast(device.type, dtype=dtype)
+                if dtype
+                else contextlib.nullcontext()
+            )
             with ctx:
                 out = model(x, condition, keep_tokens=k, condition_drop=condition_drop)
-                loss, m = criterion(out, x, step)
+                g_loss = adversary.g_term(out.pixels.recon, step)
+                loss, m = criterion(out, x, step, g_loss)
 
             opt_g.zero_grad(set_to_none=True)
             loss.backward()
             if tc.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
-                    [p for g in opt_g.param_groups for p in g["params"]],
-                    tc.grad_clip)
+                    [p for g in opt_g.param_groups for p in g["params"]], tc.grad_clip
+                )
             opt_g.step()
             ema.update(model)
 
@@ -249,14 +298,19 @@ def main():
                 model.eval()
                 with torch.no_grad():
                     grid_x = x[:32]
-                    rec = ema.shadow.reconstruct(grid_x)
+                    ema_model = cast(ImageGen, ema.shadow)
+                    rec = ema_model.reconstruct(grid_x)
                     # fixed_conditions is already capped at <=32 rows at every
                     # assignment, so no re-slice is needed here.
-                    gen = ema.shadow.generate(fixed_conditions)
-                save_image((torch.cat([grid_x, rec]) + 1) / 2,
-                           out_dir / "samples" / f"recon_{step:07d}.png", nrow=8)
-                save_image((gen + 1) / 2,
-                           out_dir / "samples" / f"gen_{step:07d}.png", nrow=8)
+                    gen = ema_model.generate(fixed_conditions)
+                save_image(
+                    (torch.cat([grid_x, rec]) + 1) / 2,
+                    out_dir / "samples" / f"recon_{step:07d}.png",
+                    nrow=8,
+                )
+                save_image(
+                    (gen + 1) / 2, out_dir / "samples" / f"gen_{step:07d}.png", nrow=8
+                )
                 model.train()
 
             if step > 0 and step % tc.ckpt_every == 0:

@@ -48,6 +48,10 @@ class LeCamRegularizer(nn.Module):
     """LeCam divergence (Tseng et al., 2021): anchors D outputs to EMA of the
     opposite side, preventing the discriminator from drifting too far ahead."""
 
+    # Registered buffers; declared so checkers see Tensor, not Module (__getattr__).
+    ema_real: torch.Tensor
+    ema_fake: torch.Tensor
+
     def __init__(self, decay: float = 0.99):
         super().__init__()
         self.decay = decay
