@@ -30,7 +30,7 @@ data:
   caption_column: caption
   image_size: 256
   channels: 3
-  batch_size: 32          # L=128 is 4x the latent seq; bs 32 keeps VRAM in budget
+  batch_size: 16          # LPIPS = 2 VGG forwards (recon+APR) at 256px; bs 32 OOMs 12GB
   num_workers: 8          # 12 cores on the box; keep the GPU fed
 
 text:
