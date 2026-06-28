@@ -30,7 +30,7 @@ data:
   caption_column: caption
   image_size: 256
   channels: 3
-  batch_size: 16          # LPIPS = 2 VGG forwards (recon+APR) at 256px; bs 32 OOMs 12GB
+  batch_size: 8           # LPIPS (2 VGG) + GAN + DINOv2 ViT-L all resident on 12GB
   num_workers: 8          # 12 cores on the box; keep the GPU fed
 
 text:
@@ -66,7 +66,9 @@ ar:
   condition_dropout: 0.1
 
 vfm:
-  enabled: false
+  enabled: true          # DINOv2-REPA (paper Table 9 = 1.0). Targets low cb_use.
+  model: dinov2_vitl14   # ungated, auto-downloads. DINOv3 is gated (license+token) -> future swap
+  weight: 1.0
 
 loss:
   # Paper Table 9 recipe. L2-only collapses a discrete tokenizer to mean color;
@@ -82,7 +84,7 @@ loss:
   lpips_enabled: true    # paper trains with LPIPS always; only VFM still off
 
 train:
-  epochs: 200
+  epochs: 20
   lr: 1.0e-4
   min_lr: 1.0e-6
   beta1: 0.9
