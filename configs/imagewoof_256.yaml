@@ -1,7 +1,11 @@
-# 256px imagewoof run on a 12GB GPU (RTX 3060). Verified: bs 32 used only 5.4GB
-# at ~120 img/s, so bs 64 fits with headroom. Baseline (GAN/LPIPS/VFM off) --
-# watch cb_use (codebook usage); if it stays <0.1 after ~2k steps, flip
-# vfm.enabled or raise entropy_weight (run-2 levers).
+# 256px imagewoof run on a 12GB GPU (RTX 3060). Baseline (GAN/LPIPS/VFM off).
+#
+# CRITICAL: num_latent_tokens must NOT be 32 at 256px. EOSTok paper (2605.00503)
+# Table 5 ablates sequence length at 256x256: L=32 -> rFID 17.50 (mean-color
+# collapse), L=128 -> rFID 1.32 / gFID 3.09 (best gFID), L=256 -> rFID 1.02. The
+# paper default is 256; we use 128 (best gFID, cheaper). latent_dim=64 matches
+# the paper's d=64. An earlier run with L=32 produced flat mean-color recons --
+# that was this, not a codebook/EMA bug.
 #
 # Why these choices fit 12GB:
 #   - captions are CACHED (Qwen runs once, then is NOT resident in training VRAM)
@@ -26,7 +30,7 @@ data:
   caption_column: caption
   image_size: 256
   channels: 3
-  batch_size: 64          # 12GB headroom: bs 32 used 5.4GB, bs 64 ~9-10GB
+  batch_size: 32          # L=128 is 4x the latent seq; bs 32 keeps VRAM in budget
   num_workers: 8          # 12 cores on the box; keep the GPU fed
 
 text:
@@ -46,8 +50,8 @@ tokenizer:
   enc_layers: 6
   dec_layers: 6
   num_heads: 6
-  num_latent_tokens: 32
-  latent_dim: 32
+  num_latent_tokens: 128  # paper Table 5: 32 collapses to mean-color at 256px
+  latent_dim: 64          # paper d=64
 
 quantizer:
   codebook_size: 1024
