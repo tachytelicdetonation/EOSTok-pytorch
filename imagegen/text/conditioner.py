@@ -383,7 +383,9 @@ class TextConditioner(nn.Module):
             mask[empty] = False
             mask[empty, 0] = True
             text_tokens[empty] = 0
-            text_tokens[empty, 0] = self.null_token
+            # null_token is a fp32 Parameter; under bf16 autocast text_tokens is
+            # bf16 and an in-place scatter has no autocast cast hook, so match dtypes.
+            text_tokens[empty, 0] = self.null_token.to(text_tokens.dtype)
 
         return TextCondition(tokens=text_tokens, mask=mask)
 

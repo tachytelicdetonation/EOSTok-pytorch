@@ -80,6 +80,23 @@ def test_forward_shapes_and_grads():
     print("forward/backward OK")
 
 
+def test_forward_under_bf16_autocast_with_empty_condition():
+    """Regression: under bf16 autocast the projected text tokens are bf16 while the
+    null_token Parameter stays fp32; the in-place scatter for forced-empty rows (CFG
+    dropout) has no autocast cast hook, so the dtypes must be matched explicitly.
+    CPU bf16 autocast reproduces the CUDA-only crash without a GPU."""
+    cfg = tiny_config()
+    model = ImageGen(cfg)
+    x = torch.randn(4, 1, 32, 32)
+    captions = ["small dog", "large dog", "dog outside", "dog portrait"]
+    # Force two rows to the null token -- the path that scatters null_token.
+    drop = torch.tensor([True, False, True, False])
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(x, captions, keep_tokens=5, condition_drop=drop)
+    assert out.pixels.recon.shape == (4, 1, 32, 32)
+    print("bf16 autocast forward OK")
+
+
 def test_generation():
     cfg = tiny_config()
     model = ImageGen(cfg).eval()

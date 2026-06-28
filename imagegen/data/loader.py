@@ -8,7 +8,7 @@ same prompt path.
 from __future__ import annotations
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data._utils.collate import default_collate
 from torchvision import transforms
 
@@ -21,10 +21,11 @@ def _image_transform(cfg: DataConfig, train: bool):
     ops = [
         transforms.Resize(cfg.image_size),
         transforms.CenterCrop(cfg.image_size),
+        *([transforms.RandomHorizontalFlip()] if train else []),
+        transforms.ToTensor(),
+        norm,
     ]
-    if train:
-        ops.append(transforms.RandomHorizontalFlip())
-    return transforms.Compose(ops + [transforms.ToTensor(), norm])
+    return transforms.Compose(ops)
 
 
 def load_hf_split(cfg: DataConfig, train: bool):
@@ -41,7 +42,7 @@ def load_hf_split(cfg: DataConfig, train: bool):
     return load_dataset(cfg.hf_name, split=split, revision=cfg.revision)
 
 
-class HFImageCaptionDataset:
+class HFImageCaptionDataset(Dataset):
     """Thin wrapper over a Hugging Face image-caption dataset."""
 
     def __init__(self, cfg: DataConfig, train: bool, text_cache: CaptionFeatureCache | None = None):
@@ -58,18 +59,18 @@ class HFImageCaptionDataset:
     def __len__(self):
         return len(self.ds)
 
-    def __getitem__(self, idx: int):
-        sample = self.ds[idx]
+    def __getitem__(self, index: int):
+        sample = self.ds[index]
         image = sample[self.cfg.image_column]
         mode = "L" if self.cfg.channels == 1 else "RGB"
         image = image.convert(mode)
         caption = str(sample[self.cfg.caption_column])
         if self.text_cache is not None:
-            return self.transform(image), self.text_cache[idx]
+            return self.transform(image), self.text_cache[index]
         return self.transform(image), caption
 
 
-class RandomImageCaptionDataset:
+class RandomImageCaptionDataset(Dataset):
     """Synthetic image+caption data for OFFLINE code-checks. No download, no real
     content -- just exercises the full train loop end-to-end (shapes, optimizer,
     EMA, sampling, checkpoint) so we can confirm the code runs before a GPU run.
@@ -85,12 +86,12 @@ class RandomImageCaptionDataset:
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx: int):
-        g = torch.Generator().manual_seed(idx)
+    def __getitem__(self, index: int):
+        g = torch.Generator().manual_seed(index)
         img = torch.rand(
             self.cfg.channels, self.cfg.image_size, self.cfg.image_size, generator=g
         )
-        return img * 2 - 1, self._CAPTIONS[idx % len(self._CAPTIONS)]
+        return img * 2 - 1, self._CAPTIONS[index % len(self._CAPTIONS)]
 
 
 def build_dataset(
