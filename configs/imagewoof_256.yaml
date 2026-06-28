@@ -1,14 +1,15 @@
-# First real 256px run on a 12GB GPU (RTX 3060). One-epoch shakedown to measure
-# reconstruction trend, timing, and peak VRAM before committing to a full run.
+# 256px imagewoof run on a 12GB GPU (RTX 3060). Verified: bs 32 used only 5.4GB
+# at ~120 img/s, so bs 64 fits with headroom. Baseline (GAN/LPIPS/VFM off) --
+# watch cb_use (codebook usage); if it stays <0.1 after ~2k steps, flip
+# vfm.enabled or raise entropy_weight (run-2 levers).
 #
 # Why these choices fit 12GB:
 #   - captions are CACHED (Qwen runs once, then is NOT resident in training VRAM)
 #   - patch_size 16 -> 16x16 = 256 patch tokens (keeps attention cost sane; a
 #     patch_size 8 would be 1024 tokens => 16x attention and would blow the card)
 #   - GAN / LPIPS / VFM all OFF (RAM-safe baseline; flip VFM on for run-2)
-#   - bs 32 leaves headroom on the APR double-decode; bump to 64 if VRAM allows.
 #
-# Run (one epoch):
+# Run:
 #   python -m imagegen.cli.train --config configs/imagewoof_256.yaml
 run_name: imagegen-imagewoof-256
 seed: 42
@@ -25,7 +26,7 @@ data:
   caption_column: caption
   image_size: 256
   channels: 3
-  batch_size: 32
+  batch_size: 64          # 12GB headroom: bs 32 used 5.4GB, bs 64 ~9-10GB
   num_workers: 8          # 12 cores on the box; keep the GPU fed
 
 text:
@@ -75,7 +76,7 @@ loss:
   lpips_enabled: false
 
 train:
-  epochs: 1               # one-epoch shakedown
+  epochs: 200
   lr: 1.0e-4
   min_lr: 1.0e-6
   beta1: 0.9
@@ -85,7 +86,7 @@ train:
   nested_dropout: 0.5
   warmup_ratio: 0.03
   grad_clip: 1.0
-  log_every: 10
-  sample_every: 50        # ~5 image dumps across one epoch
-  ckpt_every: 200
+  log_every: 50
+  sample_every: 500       # ~every 3-4 min at bs 64
+  ckpt_every: 1000
   out_dir: runs/imagewoof_256
