@@ -69,15 +69,17 @@ vfm:
   enabled: false
 
 loss:
+  # Paper Table 9 recipe. L2-only collapses a discrete tokenizer to mean color;
+  # LPIPS is the perceptual gradient that forces structure (and lifts cb_use).
   recon_l2: 1.0
-  recon_lpips: 0.0
-  gan: 0.0
+  recon_lpips: 1.0       # paper 1.0 (was 0 -> mean-color collapse)
+  gan: 0.1               # paper 0.1; kicks in at disc_start
   lecam: 0.05
   apr_l2: 1.0
-  apr_lpips: 0.0
+  apr_lpips: 1.0         # paper 1.0
   ntp: 0.1
   disc_start: 2000
-  lpips_enabled: false
+  lpips_enabled: true    # paper trains with LPIPS always; only VFM still off
 
 train:
   epochs: 200
@@ -86,7 +88,7 @@ train:
   beta1: 0.9
   beta2_tokenizer: 0.999
   beta2_ar: 0.95
-  ema_decay: 0.999
+  ema_decay: 0.99        # paper 0.9999; lowered for faster sample visibility while diagnosing
   nested_dropout: 0.5
   warmup_ratio: 0.03
   grad_clip: 1.0
