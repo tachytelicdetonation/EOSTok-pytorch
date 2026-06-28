@@ -3,7 +3,7 @@ references/
 __pycache__/
 *.pyc
 .venv/
-data/
+/data/
 runs/
 *.ckpt
 *.pt
